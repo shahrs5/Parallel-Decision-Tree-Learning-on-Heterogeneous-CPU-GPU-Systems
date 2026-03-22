@@ -1,3 +1,0 @@
-C:/Users/shahr/Documents/University/PDC/Parallel-Decision-Tree-Learning-on-Heterogeneous-CPU-GPU-Systems/decision-tree/build/CMakeFiles/decision_tree.dir
-C:/Users/shahr/Documents/University/PDC/Parallel-Decision-Tree-Learning-on-Heterogeneous-CPU-GPU-Systems/decision-tree/build/CMakeFiles/edit_cache.dir
-C:/Users/shahr/Documents/University/PDC/Parallel-Decision-Tree-Learning-on-Heterogeneous-CPU-GPU-Systems/decision-tree/build/CMakeFiles/rebuild_cache.dir
