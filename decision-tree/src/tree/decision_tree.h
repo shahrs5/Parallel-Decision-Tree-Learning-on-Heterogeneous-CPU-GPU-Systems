@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstdint>
 #include <string>
 #include <vector>
 
@@ -63,6 +64,14 @@ private:
     // All tree nodes in BFS-like allocation order.  Root = nodes_[0].
     std::vector<Node> nodes_;
 
+    // --- Presorted index tables (built once in train(), reused every node) ---
+    //
+    // sorted_indices_[f][i] = the i-th sample index when all samples are
+    // sorted ascending by feature f.  Eliminates the per-node O(N log N) sort.
+    int n_samples_ = 0;
+    int n_classes_ = 0;
+    std::vector<std::vector<int>> sorted_indices_;
+
     // Recursively build a node for the given subset of training samples.
     // Returns the index of the newly created node in nodes_.
     //
@@ -72,5 +81,6 @@ private:
     int buildNode(const std::vector<std::vector<float>>& X,
                   const std::vector<int>&                sample_indices,
                   const std::vector<int>&                y,
-                  int                                    depth);
+                  int                                    depth,
+                  const std::vector<uint8_t>&            active_mask);
 };

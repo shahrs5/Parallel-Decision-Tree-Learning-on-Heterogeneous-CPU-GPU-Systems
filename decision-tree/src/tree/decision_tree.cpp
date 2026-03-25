@@ -3,8 +3,9 @@
 #include <algorithm>    // std::sort, std::max_element
 #include <cassert>
 #include <cmath>        // std::fabs
+#include <cstdint>      // uint8_t
 #include <limits>       // std::numeric_limits
-#include <map>          // std::map (label counting)
+#include <map>          // std::map (label counting — used only in computeGini/majorityLabel)
 #include <numeric>      // std::iota
 #include <stdexcept>
 
@@ -78,15 +79,48 @@ void DecisionTree::train(const std::vector<std::vector<float>>& X,
 
     nodes_.clear();
 
+    n_samples_ = static_cast<int>(X.size());
+    n_classes_ = *std::max_element(y.begin(), y.end()) + 1;
+
+    // --- Presort each feature column once ---
+    //
+    // sorted_indices_[f] holds all sample indices sorted ascending by X[i][f].
+    // Each buildNode call filters this list to active samples in O(N), avoiding
+    // the O(N log N) re-sort that the naive approach paid at every tree node.
+    int n_features = static_cast<int>(X[0].size());
+    sorted_indices_.assign(n_features, std::vector<int>(n_samples_));
+    for (int f = 0; f < n_features; ++f) {
+        std::iota(sorted_indices_[f].begin(), sorted_indices_[f].end(), 0);
+        std::sort(sorted_indices_[f].begin(), sorted_indices_[f].end(),
+                  [&](int a, int b){ return X[a][f] < X[b][f]; });
+    }
+
     // Build index set {0, 1, …, n-1} for the root — all samples participate.
-    std::vector<int> all_indices(X.size());
+    std::vector<int> all_indices(n_samples_);
     std::iota(all_indices.begin(), all_indices.end(), 0);
 
-    buildNode(X, all_indices, y, /*depth=*/0);
+    // Active mask: active_mask[i] == 1 iff sample i is in the current node.
+    // Root node: all samples are active.
+    std::vector<uint8_t> active_mask(n_samples_, 1);
+
+    buildNode(X, all_indices, y, /*depth=*/0, active_mask);
 }
 
 // ---------------------------------------------------------------------------
-// buildNode — recursive CART split search (sequential, Milestone 1)
+// buildNode — recursive CART split search (optimised sequential, Milestone 1)
+//
+// Two CPU optimisations over the naive approach:
+//
+//  1. Presorted feature columns (sorted_indices_ built once in train()):
+//     Instead of sorting each feature at every node, we filter the globally
+//     presorted list to the active samples in O(N).  Eliminates the dominant
+//     O(N log N) sort cost from every internal node.
+//
+//  2. Incremental Gini scan:
+//     Class-count arrays (left_cnt / right_cnt) are maintained as we sweep
+//     through the sorted active samples.  Gini for each candidate threshold
+//     is computed in O(K) (K = number of classes) rather than O(N), removing
+//     the quadratic inner loop of the naive implementation.
 //
 // Milestone 2 replacement plan:
 //   The inner for-loop over features (marked below) will be replaced by:
@@ -100,7 +134,8 @@ void DecisionTree::train(const std::vector<std::vector<float>>& X,
 int DecisionTree::buildNode(const std::vector<std::vector<float>>& X,
                              const std::vector<int>&                sample_indices,
                              const std::vector<int>&                y,
-                             int                                    depth)
+                             int                                    depth,
+                             const std::vector<uint8_t>&            active_mask)
 {
     // Collect the labels for samples at this node.
     std::vector<int> labels;
@@ -131,48 +166,82 @@ int DecisionTree::buildNode(const std::vector<std::vector<float>>& X,
     // *** Milestone 2: replace this block with a GPU histogram kernel call. ***
 
     int   n_features  = static_cast<int>(X[0].size());
+    int   n           = static_cast<int>(sample_indices.size());
     float best_gain   = -std::numeric_limits<float>::infinity();
     int   best_feat   = -1;
     float best_thresh = 0.0f;
 
-    for (int f = 0; f < n_features; ++f) {
-        // Collect and sort (value, label) pairs for this feature.
-        std::vector<std::pair<float, int>> fvals;
-        fvals.reserve(sample_indices.size());
-        for (int idx : sample_indices)
-            fvals.push_back({X[idx][f], y[idx]});
-        std::sort(fvals.begin(), fvals.end());
+    // Total class counts at this node — used to initialise the right-side
+    // counts before each feature scan.
+    std::vector<int> total_cnt(n_classes_, 0);
+    for (int idx : sample_indices)
+        total_cnt[y[idx]]++;
 
-        // Evaluate candidate split thresholds at midpoints between distinct values.
-        // This is the exact (non-histogram) method; the GPU version will bin values.
-        for (std::size_t i = 0; i + 1 < fvals.size(); ++i) {
-            // Skip identical adjacent values — same threshold, different split.
-            if (fvals[i].first == fvals[i + 1].first)
+    // Reusable buffers for the incremental scan (avoids per-feature allocation).
+    std::vector<int> left_cnt(n_classes_);
+    std::vector<int> right_cnt(n_classes_);
+    std::vector<int> sorted_active;
+    sorted_active.reserve(n);
+
+    for (int f = 0; f < n_features; ++f) {
+        // --- Optimisation 1: filter the presorted column to active samples ---
+        // sorted_indices_[f] is globally sorted ascending by X[i][f].
+        // We iterate it once (O(N_total)) and keep only active samples,
+        // giving us the node's samples already in sorted order — no re-sort.
+        sorted_active.clear();
+        for (int idx : sorted_indices_[f]) {
+            if (active_mask[idx])
+                sorted_active.push_back(idx);
+        }
+
+        // --- Optimisation 2: incremental Gini scan ---
+        // Initialise: all samples on the right, none on the left.
+        std::fill(left_cnt.begin(),  left_cnt.end(),  0);
+        right_cnt = total_cnt;
+        int n_left = 0, n_right = n;
+
+        for (int i = 0; i < n - 1; ++i) {
+            int   idx = sorted_active[i];
+            int   lbl = y[idx];
+
+            // Move sample i from right to left.
+            left_cnt[lbl]++;
+            right_cnt[lbl]--;
+            n_left++;
+            n_right--;
+
+            // Only evaluate a split at value boundaries (skip ties).
+            float val_curr = X[idx][f];
+            float val_next = X[sorted_active[i + 1]][f];
+            if (val_curr == val_next)
                 continue;
 
-            float thresh = 0.5f * (fvals[i].first + fvals[i + 1].first);
+            // Enforce minimum leaf size.
+            if (n_left  < min_samples_leaf_) continue;
+            if (n_right < min_samples_leaf_) continue;
 
-            // Partition labels into left (≤ thresh) and right (> thresh) subsets.
-            std::vector<int> left_labels, right_labels;
-            for (const auto& [val, lbl] : fvals) {
-                if (val <= thresh) left_labels.push_back(lbl);
-                else               right_labels.push_back(lbl);
+            // Gini for left child — O(K), no array rebuild.
+            float g_left = 1.0f;
+            for (int k = 0; k < n_classes_; ++k) {
+                float p = static_cast<float>(left_cnt[k]) / n_left;
+                g_left -= p * p;
+            }
+            // Gini for right child — O(K).
+            float g_right = 1.0f;
+            for (int k = 0; k < n_classes_; ++k) {
+                float p = static_cast<float>(right_cnt[k]) / n_right;
+                g_right -= p * p;
             }
 
-            // Enforce minimum leaf size on both sides.
-            if (static_cast<int>(left_labels.size())  < min_samples_leaf_) continue;
-            if (static_cast<int>(right_labels.size()) < min_samples_leaf_) continue;
-
-            // Weighted Gini gain: parent impurity minus weighted child impurities.
-            float n    = static_cast<float>(sample_indices.size());
+            // Weighted Gini gain.
             float gain = nodes_[node_idx].gini
-                       - (static_cast<float>(left_labels.size())  / n) * computeGini(left_labels)
-                       - (static_cast<float>(right_labels.size()) / n) * computeGini(right_labels);
+                       - (static_cast<float>(n_left)  / n) * g_left
+                       - (static_cast<float>(n_right) / n) * g_right;
 
             if (gain > best_gain) {
                 best_gain   = gain;
                 best_feat   = f;
-                best_thresh = thresh;
+                best_thresh = 0.5f * (val_curr + val_next);
             }
         }
     }
@@ -194,10 +263,18 @@ int DecisionTree::buildNode(const std::vector<std::vector<float>>& X,
     nodes_[node_idx].feature_index = best_feat;
     nodes_[node_idx].threshold     = best_thresh;
 
+    // Build child active masks by setting/clearing entries for this split.
+    // We reuse the parent mask pattern: copy it, then deactivate the samples
+    // that go to the other side.
+    std::vector<uint8_t> left_mask  = active_mask;
+    std::vector<uint8_t> right_mask = active_mask;
+    for (int idx : left_indices)  right_mask[idx] = 0;
+    for (int idx : right_indices) left_mask[idx]  = 0;
+
     // Recurse.  IMPORTANT: nodes_ may reallocate during recursion.
     // Use nodes_[node_idx] (index) not a stored Node& after this point.
-    int left_child  = buildNode(X, left_indices,  y, depth + 1);
-    int right_child = buildNode(X, right_indices, y, depth + 1);
+    int left_child  = buildNode(X, left_indices,  y, depth + 1, left_mask);
+    int right_child = buildNode(X, right_indices, y, depth + 1, right_mask);
 
     // Re-index after potential reallocation.
     nodes_[node_idx].left_child  = left_child;
