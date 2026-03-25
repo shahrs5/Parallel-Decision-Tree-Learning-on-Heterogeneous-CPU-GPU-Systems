@@ -148,16 +148,31 @@ python eval/sklearn_compare.py
 
 ## 6. Results
 
-| Dataset       | Impl    | Train (ms) | Infer (ms) | Accuracy | Nodes |
-| ------------- | ------- | ---------- | ---------- | -------- | ----- |
-| Iris          | C++     | 0.69       | 0.0052     | 0.9667   | 17    |
-| Iris          | sklearn | 1.60       | 0.150      | 1.000    | 9     |
-| Wine          | C++     | 2.34       | 0.0060     | 0.9143   | 19    |
-| Wine          | sklearn | 1.70       | 0.184      | 0.9444   | —     |
-| Breast Cancer | C++     | 22.09      | 0.0336     | 0.9204   | 31    |
-| Breast Cancer | sklearn | 7.60       | 0.184      | 0.9298   | —     |
-| Banknote      | C++     | 9.08       | 0.0488     | 0.9672   | 37    |
-| Banknote      | sklearn | 4.43       | 0.181      | 0.9673   | —     |
+### Naive C++ Baseline (exact CART, re-sort every node)
+
+| Dataset       | Impl        | Train (ms) | Infer (ms) | Accuracy | Nodes |
+| ------------- | ----------- | ---------- | ---------- | -------- | ----- |
+| Iris          | C++ (naive) | 7.15       | 0.0064     | 0.9667   | 17    |
+| Iris          | sklearn     | 1.60       | 0.150      | 1.000    | 9     |
+| Wine          | C++ (naive) | 57.68      | 0.0053     | 0.9143   | 19    |
+| Wine          | sklearn     | 1.70       | 0.184      | 0.9444   | —     |
+| Breast Cancer | C++ (naive) | 1892.57    | 0.0170     | 0.9204   | 31    |
+| Breast Cancer | sklearn     | 7.60       | 0.184      | 0.9298   | —     |
+| Banknote      | C++ (naive) | 1135.82    | 0.0379     | 0.9672   | 37    |
+| Banknote      | sklearn     | 4.43       | 0.181      | 0.9673   | —     |
+
+### Optimised C++ (presort + incremental Gini scan)
+
+| Dataset       | Impl             | Train (ms) | Infer (ms) | Accuracy | Nodes |
+| ------------- | ---------------- | ---------- | ---------- | -------- | ----- |
+| Iris          | C++ (optimised)  | 0.69       | 0.0052     | 0.9667   | 17    |
+| Iris          | sklearn          | 1.60       | 0.150      | 1.000    | 9     |
+| Wine          | C++ (optimised)  | 2.34       | 0.0060     | 0.9143   | 19    |
+| Wine          | sklearn          | 1.70       | 0.184      | 0.9444   | —     |
+| Breast Cancer | C++ (optimised)  | 22.09      | 0.0336     | 0.9204   | 31    |
+| Breast Cancer | sklearn          | 7.60       | 0.184      | 0.9298   | —     |
+| Banknote      | C++ (optimised)  | 9.08       | 0.0488     | 0.9672   | 37    |
+| Banknote      | sklearn          | 4.43       | 0.181      | 0.9673   | —     |
 
 ---
 
