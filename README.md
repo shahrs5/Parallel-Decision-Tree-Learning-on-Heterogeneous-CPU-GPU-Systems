@@ -1,196 +1,319 @@
 # Parallel Decision Tree Learning on Heterogeneous CPU–GPU Systems
 
+## Overview
+
+This project implements a **CART-style decision tree classifier** in C++ as the baseline stage for a larger heterogeneous CPU–GPU learning pipeline. The long-term goal is to accelerate the most expensive part of tree training — **split evaluation** — using GPU kernels, while keeping control flow and tree structure management on the CPU.
+
+This repository currently contains the **Milestone 1 sequential baseline**, which includes:
+
+- A working decision tree classifier for **numerical datasets only**
+- **Gini impurity** as the split criterion
+- Recursive binary node splitting
+- Configurable stopping conditions
+- CSV data loading
+- Correctness tests
+- Benchmark evaluation on multiple datasets
+- Comparison against **scikit-learn**
+
 ---
 
-## 📁 Project Structure
+## Milestone 1 Scope
 
-```text
+Milestone 1 focuses on building a **correct and measurable sequential baseline**.
+
+**Implemented in this milestone:**
+
+- CART-style binary/multiclass decision tree classifier
+- Gini impurity calculation
+- Recursive node construction
+- Prediction for individual samples
+- Numerical CSV dataset loading
+- Configurable `max_depth` and `min_samples_leaf`
+- Unit tests for impurity, loader, and training/prediction
+- Benchmark runs on Iris, Wine, Breast Cancer Wisconsin, and Banknote Authentication
+- Runtime and accuracy reporting
+- Comparison against scikit-learn
+
+> **Note on split evaluation:** The implementation performs **exact split search**. For each feature at a node, feature values are sorted and candidate thresholds are evaluated using an **incremental left/right class-count sweep**, avoiding the need to rebuild label vectors for every threshold. More aggressive techniques such as histogram-based split finding and GPU kernels are planned for Milestone 2.
+
+---
+
+## Project Structure
+
+```
 decision-tree/
-├── CMakeLists.txt          # C++17 build; CUDA disabled by default (enable in M2)
-├── data/                   # Place datasets here (.csv)
+├── CMakeLists.txt
+├── .gitignore
+├── data/
+│   ├── iris.csv
+│   ├── wine.csv
+│   ├── breast_cancer.csv
+│   └── banknote.csv
+├── eval/
+│   ├── metrics.h
+│   ├── download_datasets.py
+│   └── sklearn_compare.py
 ├── src/
-│   ├── main.cpp            # Verification tests for M1
-│   ├── data_loader.h       # CSV loader (header-only)
-│   ├── tree/
-│   │   ├── node.h          # Node struct (array-of-structs layout)
-│   │   ├── decision_tree.h # DecisionTree class interface
-│   │   └── decision_tree.cpp  # Gini impurity, training, prediction
-│   └── gpu/
-│       └── split_kernel.cu # GPU split-finding kernels (M2 stub)
-└── eval/
-    ├── metrics.h
-    ├── download_datasets.py
-    └── sklearn_compare.py
+│   ├── main.cpp
+│   ├── data_loader.h
+│   └── tree/
+│       ├── node.h
+│       ├── decision_tree.h
+│       └── decision_tree.cpp
+└── build/
 ```
 
----
+### File Descriptions
 
-## 1. Project Overview
-
-A CART-style binary decision tree classifier implemented in **C++17**, progressively parallelised across milestones using CPU threading and CUDA.
-
-### Milestones
-
-| Milestone | Focus                                                    | Status     |
-| --------- | -------------------------------------------------------- | ---------- |
-| **M1**    | Sequential baseline (CART, Gini, CSV loader, benchmarks) | ✅ Complete |
-| **M2**    | GPU split finding (histograms, level-wise expansion)     | ⏳ Planned  |
-| **M3**    | Parallel random forest + inference optimisation          | ⏳ Planned  |
-
----
-
-## 2. Repository Structure
-
-| File                         | Description                                       |
-| ---------------------------- | ------------------------------------------------- |
-| `CMakeLists.txt`             | Build config; enable CUDA with `-DENABLE_CUDA=ON` |
-| `src/main.cpp`               | Entry point: tests + dataset benchmarks           |
-| `src/data_loader.h`          | Header-only CSV loader                            |
-| `src/tree/node.h`            | Node structure (array-of-structs)                 |
-| `src/tree/decision_tree.h`   | Class interface                                   |
-| `src/tree/decision_tree.cpp` | Training + prediction logic                       |
-| `src/gpu/split_kernel.cu`    | GPU kernels (M2)                                  |
-| `eval/metrics.h`             | Accuracy helper                                   |
-| `eval/sklearn_compare.py`    | Comparison with sklearn                           |
-| `eval/download_datasets.py`  | Dataset downloader                                |
-| `data/`                      | Dataset storage                                   |
+| File | Description |
+|---|---|
+| `CMakeLists.txt` | CMake build configuration. CUDA support is scaffolded but disabled by default for Milestone 1. |
+| `src/main.cpp` | Entry point for unit tests and dataset benchmarks. |
+| `src/data_loader.h` | Header-only CSV loader for numerical datasets with integer labels in the last column. |
+| `src/tree/node.h` | Node structure used to store tree state in a flat vector. |
+| `src/tree/decision_tree.h` | Public interface for the decision tree classifier. |
+| `src/tree/decision_tree.cpp` | Core training and prediction logic, including exact split evaluation with incremental class-count updates. |
+| `eval/metrics.h` | Accuracy metric for evaluation. |
+| `eval/sklearn_compare.py` | Reference comparison against scikit-learn using the same datasets and hyperparameters. |
+| `eval/download_datasets.py` | Helper script for obtaining benchmark datasets. |
 
 ---
 
-## 3. Algorithm
+## Algorithm
 
-### CART Training
+### 1. Tree Type
 
-* Searches all features and thresholds
-* Uses midpoints between sorted values
-* Maximises **Gini gain**
+The model is a binary/multiclass classification decision tree based on the **CART framework**. At each node, the algorithm searches for the feature and threshold that maximize impurity reduction.
 
-### Gini Impurity
+### 2. Split Criterion: Gini Impurity
 
-```
-Gini = 1 − Σ p_k²
-```
+$$\text{Gini} = 1 - \sum_k p_k^2$$
 
-* 0 → pure node
-* 0.5 → max impurity (binary)
+where $p_k$ is the proportion of samples belonging to class $k$.
 
-### Stopping Conditions
+- `Gini = 0` → the node is pure
+- Larger values → more mixed classes
+- The chosen split is the one with the highest **weighted impurity reduction**
 
-* Node becomes pure
-* Samples < `2 × min_samples_leaf`
-* Max depth reached
-* No positive split gain
+### 3. Split Search
 
-### Node Storage
+For each feature at a node:
 
-* Stored in `std::vector<Node>`
-* Indexed children (no pointers)
-* GPU-friendly design
+1. Collect `(feature_value, label)` pairs for all samples
+2. Sort by feature value
+3. Sweep once left to right, maintaining incremental class counts for left and right partitions
+4. Evaluate thresholds only between distinct adjacent feature values
+5. Choose the split with maximum Gini gain
+
+This is an **exact** split evaluation method, not a histogram approximation. It avoids the costly per-threshold reconstruction of label vectors common in naive implementations.
+
+### 4. Stopping Conditions
+
+A node becomes a leaf if any of the following hold:
+
+- The node is pure
+- The number of samples is too small to create two valid children
+- Maximum depth has been reached
+- No valid split improves impurity
+
+### 5. Tree Representation
+
+The tree is stored as a flat `std::vector<Node>`. Each node contains:
+
+- Split feature index and threshold
+- Impurity value
+- Left and right child indices
+- Predicted label
+- Sample count
+- Leaf flag
+
+This design is simple and future-friendly for serialization, compact traversal, and GPU-compatible layouts in later milestones.
 
 ---
 
-## 4. Build & Run
+## Build Instructions
 
-### CPU (Milestone 1)
+### Requirements
+
+- CMake 3.18+
+- C++17 compiler
+- Python 3 (for sklearn comparison)
+- *(Optional)* Virtual environment for Python packages
+
+> This project is easiest to build in **WSL (Ubuntu) + VS Code** or directly on Linux.
+
+### CPU-Only Build
 
 ```bash
-cd decision-tree
-cmake -B build && cmake --build build
+cmake -B build
+cmake --build build
 ./build/decision_tree
 ```
 
-### With CUDA (Milestone 2+)
+Or from inside the `build/` folder:
+
+```bash
+cmake ..
+make
+./decision_tree
+```
+
+### Optional CUDA Build Scaffold
+
+CUDA is not required for Milestone 1, but the build system includes an optional flag for future milestones:
 
 ```bash
 cmake -B build -DENABLE_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=86
 cmake --build build
 ```
 
-**GPU Architectures:**
+---
 
-* 75 → RTX 20xx
-* 86 → RTX 30xx
-* 89 → RTX 40xx
+## Dataset Format
 
-### Datasets
+The CSV loader expects:
+
+- An optional header row (automatically skipped if the first token is non-numeric)
+- All feature columns numeric
+- Final column = integer label
+
+**Example:**
+
+```
+5.1,3.5,1.4,0.2,0
+4.9,3.0,1.4,0.2,0
+6.2,3.4,5.4,2.3,2
+```
+
+> All rows must have a consistent number of columns. Labels must be numeric integers.
+
+---
+
+## Running the Program
 
 ```bash
-python eval/download_datasets.py
+./build/decision_tree
+```
+
+The program performs:
+
+- Unit tests for Gini impurity, CSV loader, and tree training/prediction
+- Benchmark evaluation on all available datasets in `data/`
+- Summary table output including: samples, features, max depth, training time, inference time, and accuracy
+
+---
+
+## Benchmark Datasets
+
+| Dataset | Samples | Features | Classes |
+|---|---|---|---|
+| Iris | 150 | 4 | 3 |
+| Wine | 178 | 13 | 3 |
+| Breast Cancer Wisconsin | 569 | 30 | 2 |
+| Banknote Authentication | 1372 | 4 | 2 |
+
+These provide a mix of small/medium dataset sizes, low/high feature counts, and binary/multiclass problems.
+
+---
+
+## Milestone 1 Results
+
+| Dataset | Samples | Features | Max Depth | Train Time (ms) | Infer Time (ms) | Accuracy |
+|---|---|---|---|---|---|---|
+| Iris | 150 | 4 | 5 | 1.4107 | 0.0053 | 0.9667 |
+| Wine | 178 | 13 | 5 | 6.1778 | 0.0057 | 0.9143 |
+| Breast Cancer | 569 | 30 | 7 | 63.5258 | 0.0270 | 0.9204 |
+| Banknote Auth | 1372 | 4 | 5 | 20.8634 | 0.0486 | 0.9672 |
+
+**Observations:**
+
+- Accuracy is strong across all four datasets
+- Training time scales with both sample count and feature count
+- Breast Cancer is slower primarily due to its 30-feature input space
+- Inference remains very fast, as prediction follows a single root-to-leaf path
+
+---
+
+## Comparison with scikit-learn
+
+```bash
 python eval/sklearn_compare.py
 ```
 
----
+With a virtual environment:
 
-## 5. Datasets
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install pandas scikit-learn numpy
+python eval/sklearn_compare.py
+```
 
-| Dataset       | Samples | Features | Classes | Max Depth | Min Leaf | Purpose           |
-| ------------- | ------- | -------- | ------- | --------- | -------- | ----------------- |
-| Iris          | 150     | 4        | 3       | 5         | 1        | Simple baseline   |
-| Wine          | 178     | 13       | 3       | 5         | 1        | Feature scaling   |
-| Breast Cancer | 569     | 30       | 2       | 7         | 2        | High-dim dataset  |
-| Banknote Auth | 1372    | 4        | 2       | 5         | 1        | Large sample test |
+The script loads the same benchmark datasets, trains `DecisionTreeClassifier`, and reports training time, inference time, accuracy, and node count.
 
----
-
-## 6. Results
-
-| Dataset       | Impl    | Train (ms) | Infer (ms) | Accuracy | Nodes |
-| ------------- | ------- | ---------- | ---------- | -------- | ----- |
-| Iris          | C++     | 7.15       | 0.0064     | 0.9667   | 17    |
-| Iris          | sklearn | 1.60       | 0.150      | 1.000    | 9     |
-| Wine          | C++     | 57.68      | 0.0053     | 0.9143   | 19    |
-| Wine          | sklearn | 1.70       | 0.184      | 0.9444   | —     |
-| Breast Cancer | C++     | 1892.57    | 0.0170     | 0.9204   | 31    |
-| Breast Cancer | sklearn | 7.60       | 0.184      | 0.9298   | —     |
-| Banknote      | C++     | 1135.82    | 0.0379     | 0.9672   | 37    |
-| Banknote      | sklearn | 4.43       | 0.181      | 0.9673   | —     |
+The goal is not necessarily to outperform scikit-learn — the comparison demonstrates correctness, closeness of achieved accuracy, and areas where optimized libraries still hold an advantage.
 
 ---
 
-## 7. Analysis
+## Design Decisions
 
-### Training Time
+**Why a flat node vector instead of pointers?**
+A flat vector with child indices is easier to debug, serialize, and extend to GPU-friendly or ensemble storage layouts.
 
-* Scales with **N × F × V**
-* High features (Breast Cancer) → slow
-* High samples (Banknote) → slow
+**Why exact split search instead of histogram binning?**
+Milestone 1 focuses on correctness and a measurable sequential baseline. Exact split search is straightforward to verify and provides a strong reference before introducing approximation or GPU parallelism.
 
-### Key Insight
-
-* Your bottleneck is **split search loop**
-* sklearn is faster due to optimized backend
-
-### Inference
-
-* C++ is **20–400× faster**
-* Reason: no Python overhead
-
-### Accuracy
-
-* Within **1–3% of sklearn**
-* Differences due to tie-breaking
-
-### Why GPU Matters
-
-* Split search = fully parallel problem
-* Histogram binning reduces complexity
-* CUDA will directly attack bottleneck
+**Why incremental class counts?**
+This reduces redundant work in split evaluation without changing the correctness of the exact CART algorithm.
 
 ---
 
-## 8. Team Roles
+## Limitations
 
-* Student 1 → Sequential tree (M1 ✅)
-* Student 2 → GPU kernels (M2)
-* Student 3 → CPU–GPU coordination (M2)
-* Student 4 → Ensemble + optimisation (M3)
+This Milestone 1 implementation intentionally has the following limitations:
+
+- Numerical features only
+- Integer labels expected in CSV
+- No categorical feature handling
+- No pruning
+- No missing-value handling
+- No ensemble model
+- No GPU acceleration
+
+These will be addressed in later milestones.
 
 ---
 
-### Notes
+## Future Work
 
-* This version focuses on **readability + structure**
-* Tables replace messy ASCII formatting
-* Clean sections improve GitHub presentation
+### Milestone 2
+- GPU-accelerated split evaluation
+- Histogram-based split finding
+- Level-wise node expansion
+- Reduced CPU–GPU transfer overhead
+
+### Milestone 3
+- Small random forest ensemble
+- Parallel tree training
+- Inference optimization
+- Throughput evaluation
 
 ---
+
+## Clean Rebuild
+
+```bash
+rm -rf build
+cmake -B build
+cmake --build build
+./build/decision_tree
+```
+
+On Windows CMD:
+
+```cmd
+rmdir /s /q build
+cmake -B build
+cmake --build build
+build\decision_tree.exe
+```

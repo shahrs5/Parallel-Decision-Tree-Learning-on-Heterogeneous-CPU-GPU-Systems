@@ -25,9 +25,9 @@
 //   after ensuring the data is in a contiguous 2-D array.  Consider
 //   switching to std::vector<float> with manual indexing at that point.
 // ---------------------------------------------------------------------------
-inline int loadCSV(const std::string&              filepath,
-                   std::vector<std::vector<float>>& X,
-                   std::vector<int>&                y)
+inline int loadCSV(const std::string &filepath,
+                   std::vector<std::vector<float>> &X,
+                   std::vector<int> &y)
 {
     std::ifstream file(filepath);
     if (!file.is_open())
@@ -38,8 +38,11 @@ inline int loadCSV(const std::string&              filepath,
 
     std::string line;
     bool first_row = true;
+    std::size_t expected_cols = 0;
+    bool expected_cols_set = false;
 
-    while (std::getline(file, line)) {
+    while (std::getline(file, line))
+    {
         // Strip Windows-style carriage return (\r\n → \n).
         if (!line.empty() && line.back() == '\r')
             line.pop_back();
@@ -61,23 +64,42 @@ inline int loadCSV(const std::string&              filepath,
 
         // Auto-detect and skip a header row: if the first token cannot be
         // parsed as a floating-point number, treat it as a header.
-        if (first_row) {
+        if (first_row)
+        {
             first_row = false;
-            try {
+            try
+            {
                 std::stof(tokens[0]);
-            } catch (...) {
+            }
+            catch (...)
+            {
                 continue; // header row — skip it
             }
         }
 
         if (tokens.size() < 2)
             throw std::runtime_error("loadCSV: row has fewer than 2 columns");
-
+        if (!expected_cols_set)
+        {
+            expected_cols = tokens.size();
+            expected_cols_set = true;
+        }
+        else if (tokens.size() != expected_cols)
+        {
+            throw std::runtime_error("loadCSV: inconsistent column count across rows");
+        }
         // All tokens except the last → features.
         std::vector<float> row;
         row.reserve(tokens.size() - 1);
         for (std::size_t i = 0; i + 1 < tokens.size(); ++i)
-            row.push_back(std::stof(tokens[i]));
+            try
+            {
+                row.push_back(std::stof(tokens[i]));
+            }
+            catch (...)
+            {
+                throw std::runtime_error("loadCSV: invalid numeric feature value");
+            }
 
         // Last token → integer label.
         // stof handles both "0" and "0.0" gracefully.
