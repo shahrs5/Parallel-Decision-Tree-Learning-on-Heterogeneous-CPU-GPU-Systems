@@ -1,2 +1,5 @@
+.venv/
+venv/
 build/
-*.exe
+*.pyc
+__pycache__/
