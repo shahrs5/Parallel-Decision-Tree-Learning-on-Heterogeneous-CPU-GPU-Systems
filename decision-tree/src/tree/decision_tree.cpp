@@ -1,302 +1,417 @@
 #include "decision_tree.h"
 
-#include <algorithm>    // std::sort, std::max_element
-#include <cassert>
-#include <cmath>        // std::fabs
-#include <cstdint>      // uint8_t
-#include <limits>       // std::numeric_limits
-#include <map>          // std::map (label counting — used only in computeGini/majorityLabel)
-#include <numeric>      // std::iota
+#include <algorithm>
+#include <cmath>
+#include <limits>
+#include <map>
+#include <numeric>
 #include <stdexcept>
+#include <vector>
+
+// OpenMP (Person 3): parallelise the level-wise node loop.
+#ifdef USE_OPENMP
+#include <omp.h>
+#endif
+
+// CUDA GPU split path (Person 3).
+#ifdef USE_CUDA
+#include "../gpu/split_kernel.cuh"
+#endif
 
 // ---------------------------------------------------------------------------
-// Constructor
+// Internal helper
 // ---------------------------------------------------------------------------
-
-DecisionTree::DecisionTree(int max_depth, int min_samples_leaf)
-    : max_depth_(max_depth), min_samples_leaf_(min_samples_leaf) {}
-
-// ---------------------------------------------------------------------------
-// computeGini
-//
-// Gini impurity measures the probability that a randomly chosen sample would
-// be mis-classified if labelled according to the distribution at this node.
-//
-//   Gini = 1 - Σ_k  p_k²
-//
-// Implementation counts label frequencies in a map, then subtracts p²
-// for each class from 1.  O(n log K) where K = number of distinct classes.
-// ---------------------------------------------------------------------------
-
-float DecisionTree::computeGini(const std::vector<int>& labels) {
-    if (labels.empty())
-        return 0.0f;
-
-    // Count how many samples belong to each class.
-    std::map<int, int> counts;
-    for (int label : labels)
-        counts[label]++;
-
+static float giniFromCounts(const std::map<int, int> &counts, int total)
+{
+    if (total == 0) return 0.0f;
     float gini = 1.0f;
-    float n    = static_cast<float>(labels.size());
-
-    for (const auto& [label, count] : counts) {
-        float p  = static_cast<float>(count) / n;
-        gini    -= p * p;
+    float n    = static_cast<float>(total);
+    for (const auto &[label, count] : counts) {
+        float p = static_cast<float>(count) / n;
+        gini -= p * p;
     }
-
     return gini;
 }
 
 // ---------------------------------------------------------------------------
-// majorityLabel
+// Constructor / Destructor
 // ---------------------------------------------------------------------------
+DecisionTree::DecisionTree(int max_depth, int min_samples_leaf)
+    : max_depth_(max_depth), min_samples_leaf_(min_samples_leaf)
+{
+    if (max_depth_        < 0) throw std::runtime_error("max_depth must be >= 0");
+    if (min_samples_leaf_ < 1) throw std::runtime_error("min_samples_leaf must be >= 1");
+}
 
-int DecisionTree::majorityLabel(const std::vector<int>& labels) {
-    std::map<int, int> counts;
-    for (int label : labels)
-        counts[label]++;
-
-    // max_element with a comparator on the count (second) field.
-    return std::max_element(
-               counts.begin(), counts.end(),
-               [](const auto& a, const auto& b) {
-                   return a.second < b.second;
-               })
-        ->first;
+DecisionTree::~DecisionTree()
+{
+#ifdef USE_CUDA
+    if (d_X_) { freeGPUData(d_X_, d_y_); d_X_ = nullptr; d_y_ = nullptr; }
+#endif
 }
 
 // ---------------------------------------------------------------------------
-// train
+// Static utilities
 // ---------------------------------------------------------------------------
+float DecisionTree::computeGini(const std::vector<int> &labels)
+{
+    if (labels.empty()) return 0.0f;
+    std::map<int, int> counts;
+    for (int l : labels) counts[l]++;
+    return giniFromCounts(counts, static_cast<int>(labels.size()));
+}
 
-void DecisionTree::train(const std::vector<std::vector<float>>& X,
-                         const std::vector<int>&                y) {
-    if (X.empty() || y.empty())
-        throw std::runtime_error("DecisionTree::train: training data is empty");
-    if (X.size() != y.size())
-        throw std::runtime_error("DecisionTree::train: X and y size mismatch");
+int DecisionTree::majorityLabel(const std::vector<int> &labels)
+{
+    if (labels.empty()) throw std::runtime_error("majorityLabel: empty labels");
+    std::map<int, int> counts;
+    for (int l : labels) counts[l]++;
+    return std::max_element(counts.begin(), counts.end(),
+                            [](const auto &a, const auto &b) {
+                                return a.second < b.second;
+                            })->first;
+}
+
+// ---------------------------------------------------------------------------
+// createEmptyNode
+// ---------------------------------------------------------------------------
+int DecisionTree::createEmptyNode()
+{
+    int idx = static_cast<int>(nodes_.size());
+    nodes_.emplace_back();
+    return idx;
+}
+
+// ---------------------------------------------------------------------------
+// train — entry point
+// Person 3: flatten X once, upload to GPU (CUDA path), then run level-wise.
+// ---------------------------------------------------------------------------
+void DecisionTree::train(const std::vector<std::vector<float>> &X,
+                         const std::vector<int> &y)
+{
+    if (X.empty() || y.empty())          throw std::runtime_error("train: empty data");
+    if (X.size() != y.size())            throw std::runtime_error("train: X/y size mismatch");
+    if (X[0].empty())                    throw std::runtime_error("train: empty feature rows");
+
+    n_samples_  = static_cast<int>(X.size());
+    n_features_ = static_cast<int>(X[0].size());
+
+    for (std::size_t i = 1; i < X.size(); ++i)
+        if (static_cast<int>(X[i].size()) != n_features_)
+            throw std::runtime_error("train: inconsistent feature count");
+
+    // Flatten row-major for GPU upload (Person 3).
+    X_flat_.resize((std::size_t)n_samples_ * n_features_);
+    for (int i = 0; i < n_samples_; ++i)
+        for (int f = 0; f < n_features_; ++f)
+            X_flat_[(std::size_t)i * n_features_ + f] = X[i][f];
+
+#ifdef USE_CUDA
+    // Free any previous allocation, then upload once.
+    if (d_X_) { freeGPUData(d_X_, d_y_); }
+    uploadDataToGPU(X_flat_.data(), y.data(), n_samples_, n_features_, &d_X_, &d_y_);
+#endif
 
     nodes_.clear();
-
-    n_samples_ = static_cast<int>(X.size());
-    n_classes_ = *std::max_element(y.begin(), y.end()) + 1;
-
-    // --- Presort each feature column once ---
-    //
-    // sorted_indices_[f] holds all sample indices sorted ascending by X[i][f].
-    // Each buildNode call filters this list to active samples in O(N), avoiding
-    // the O(N log N) re-sort that the naive approach paid at every tree node.
-    int n_features = static_cast<int>(X[0].size());
-    sorted_indices_.assign(n_features, std::vector<int>(n_samples_));
-    for (int f = 0; f < n_features; ++f) {
-        std::iota(sorted_indices_[f].begin(), sorted_indices_[f].end(), 0);
-        std::sort(sorted_indices_[f].begin(), sorted_indices_[f].end(),
-                  [&](int a, int b){ return X[a][f] < X[b][f]; });
-    }
-
-    // Build index set {0, 1, …, n-1} for the root — all samples participate.
-    std::vector<int> all_indices(n_samples_);
-    std::iota(all_indices.begin(), all_indices.end(), 0);
-
-    // Active mask: active_mask[i] == 1 iff sample i is in the current node.
-    // Root node: all samples are active.
-    std::vector<uint8_t> active_mask(n_samples_, 1);
-
-    buildNode(X, all_indices, y, /*depth=*/0, active_mask);
+    trainLevelWise(X, y);
 }
 
 // ---------------------------------------------------------------------------
-// buildNode — recursive CART split search (optimised sequential, Milestone 1)
+// trainLevelWise
+// Person 3: level-wise BFS tree construction with optional OpenMP parallelism.
 //
-// Two CPU optimisations over the naive approach:
-//
-//  1. Presorted feature columns (sorted_indices_ built once in train()):
-//     Instead of sorting each feature at every node, we filter the globally
-//     presorted list to the active samples in O(N).  Eliminates the dominant
-//     O(N log N) sort cost from every internal node.
-//
-//  2. Incremental Gini scan:
-//     Class-count arrays (left_cnt / right_cnt) are maintained as we sweep
-//     through the sorted active samples.  Gini for each candidate threshold
-//     is computed in O(K) (K = number of classes) rather than O(N), removing
-//     the quadratic inner loop of the naive implementation.
-//
-// Milestone 2 replacement plan:
-//   The inner for-loop over features (marked below) will be replaced by:
-//     1. A GPU call that builds histograms for all features in parallel.
-//     2. A second GPU pass that evaluates Gini gain per bin and returns
-//        (best_feature, best_threshold) to the CPU.
-//   Everything outside that loop (node allocation, partitioning, recursion)
-//   remains on the CPU and is unchanged.
+// Each iteration processes all nodes at the current depth simultaneously.
+// With OpenMP:  nodes at the same level are split in parallel threads.
+// With CUDA:    findBestSplitForNode → findBestSplitGPU per node.
 // ---------------------------------------------------------------------------
-
-int DecisionTree::buildNode(const std::vector<std::vector<float>>& X,
-                             const std::vector<int>&                sample_indices,
-                             const std::vector<int>&                y,
-                             int                                    depth,
-                             const std::vector<uint8_t>&            active_mask)
+void DecisionTree::trainLevelWise(const std::vector<std::vector<float>> &X,
+                                  const std::vector<int> &y)
 {
-    // Collect the labels for samples at this node.
+    std::vector<int> all_indices(X.size());
+    std::iota(all_indices.begin(), all_indices.end(), 0);
+
+    int root_idx = createEmptyNode();
+    std::vector<PendingNode> current_level;
+    current_level.push_back({root_idx, all_indices, 0});
+
+    while (!current_level.empty()) {
+        int n_nodes = static_cast<int>(current_level.size());
+
+        // Pre-allocate split results so OpenMP threads can write without races.
+        std::vector<int>   best_feats(n_nodes, -1);
+        std::vector<float> best_thresholds(n_nodes, 0.0f);
+        std::vector<bool>  split_found(n_nodes, false);
+        std::vector<bool>  make_leaf(n_nodes, false);
+
+        // ----------------------------------------------------------------
+        // Phase 1: compute splits.
+        // Parallelism strategy (adaptive):
+        //   - When n_nodes >= max_threads: node-level parallel (many nodes to share).
+        //   - When n_nodes < max_threads:  run node loop serially; feature-level
+        //     parallelism inside findBestSplitForNode() kicks in instead
+        //     (controlled by omp_in_parallel() check there).
+        // This avoids nested OpenMP and keeps full thread utilisation at both
+        // shallow levels (few nodes, many features) and deep levels (many nodes).
+        // ----------------------------------------------------------------
+#ifdef USE_OPENMP
+        #pragma omp parallel for schedule(dynamic) if(n_nodes >= omp_get_max_threads())
+#endif
+        for (int ni = 0; ni < n_nodes; ++ni) {
+            const auto &work   = current_level[ni];
+            const auto &sidx   = work.sample_indices;
+            int         nidx   = work.node_idx;
+            int         depth  = work.depth;
+
+            // Gather labels.
+            std::vector<int> labels;
+            labels.reserve(sidx.size());
+            for (int idx : sidx) labels.push_back(y[idx]);
+
+            float gini        = computeGini(labels);
+            bool  is_pure     = (gini < 1e-9f);
+            bool  too_few     = (static_cast<int>(sidx.size()) < 2 * min_samples_leaf_);
+            bool  at_max_dep  = (depth >= max_depth_);
+
+            // Write non-split fields (these nodes are pre-allocated).
+            // Concurrent writes to different node indices are safe.
+            nodes_[nidx].sample_count = static_cast<int>(sidx.size());
+            nodes_[nidx].gini         = gini;
+            nodes_[nidx].label        = majorityLabel(labels);
+
+            if (is_pure || too_few || at_max_dep) {
+                make_leaf[ni] = true;
+                continue;
+            }
+
+            int   bf = -1;
+            float bt = 0.0f;
+            bool  found = false;
+
+#ifdef USE_CUDA
+            // GPU path (Person 2 kernels, called by Person 3).
+            // Detect number of distinct classes in this node.
+            std::map<int,int> cls_map;
+            for (int l : labels) cls_map[l]++;
+            int n_classes = static_cast<int>(cls_map.size());
+
+            findBestSplitGPU(
+                d_X_, d_y_,
+                sidx.data(), static_cast<int>(sidx.size()),
+                n_features_,
+                /*n_bins=*/32,
+                n_classes,
+                gini,
+                min_samples_leaf_,
+                bf, bt);
+            found = (bf >= 0);
+#else
+            // CPU path (histogram-based exact split — Milestone 1 code).
+            found = findBestSplitForNode(X, sidx, y, bf, bt);
+#endif
+            best_feats[ni]      = bf;
+            best_thresholds[ni] = bt;
+            split_found[ni]     = found;
+        }
+
+        // ----------------------------------------------------------------
+        // Phase 2: apply splits, allocate children (serial — tree mutation)
+        // ----------------------------------------------------------------
+        std::vector<PendingNode> next_level;
+
+        for (int ni = 0; ni < n_nodes; ++ni) {
+            const auto &work  = current_level[ni];
+            int         nidx  = work.node_idx;
+            int         depth = work.depth;
+            const auto &sidx  = work.sample_indices;
+
+            if (make_leaf[ni] || !split_found[ni]) {
+                nodes_[nidx].is_leaf = true;
+                continue;
+            }
+
+            int   bf = best_feats[ni];
+            float bt = best_thresholds[ni];
+
+            std::vector<int> left_idx, right_idx;
+            left_idx.reserve(sidx.size());
+            right_idx.reserve(sidx.size());
+            for (int idx : sidx) {
+                if (X[idx][bf] <= bt) left_idx.push_back(idx);
+                else                   right_idx.push_back(idx);
+            }
+
+            if (left_idx.empty() || right_idx.empty()) {
+                nodes_[nidx].is_leaf = true;
+                continue;
+            }
+
+            nodes_[nidx].feature_index = bf;
+            nodes_[nidx].threshold     = bt;
+            nodes_[nidx].is_leaf       = false;
+
+            int lc = createEmptyNode();
+            int rc = createEmptyNode();
+            nodes_[nidx].left_child  = lc;
+            nodes_[nidx].right_child = rc;
+
+            next_level.push_back({lc, std::move(left_idx),  depth + 1});
+            next_level.push_back({rc, std::move(right_idx), depth + 1});
+        }
+
+        current_level = std::move(next_level);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// findBestSplitForNode — CPU exact split (Milestone 1 code, unchanged)
+// ---------------------------------------------------------------------------
+bool DecisionTree::findBestSplitForNode(
+    const std::vector<std::vector<float>> &X,
+    const std::vector<int> &sample_indices,
+    const std::vector<int> &y,
+    int   &best_feat,
+    float &best_thresh) const
+{
+    int n_features = static_cast<int>(X[0].size());
+    best_feat   = -1;
+    best_thresh = 0.0f;
+
     std::vector<int> labels;
     labels.reserve(sample_indices.size());
-    for (int idx : sample_indices)
-        labels.push_back(y[idx]);
+    for (int idx : sample_indices) labels.push_back(y[idx]);
+    float parent_gini = computeGini(labels);
 
-    // Allocate a slot for this node BEFORE recursing (children get higher indices).
-    int  node_idx = static_cast<int>(nodes_.size());
+    // One result slot per feature — threads write to separate indices, no races.
+    std::vector<float> f_gain(n_features, -std::numeric_limits<float>::infinity());
+    std::vector<float> f_thresh(n_features, 0.0f);
+
+    // Feature-level parallelism:
+    //   Activates only when:
+    //   (a) not already inside a parallel region (no nested OpenMP), AND
+    //   (b) enough samples in this node to make thread overhead worthwhile.
+    //   Threshold 256: below this the sort+sweep finishes in < thread-launch time.
+    int n_active = static_cast<int>(sample_indices.size());
+#ifdef USE_OPENMP
+    #pragma omp parallel for schedule(static) if(!omp_in_parallel() && n_active >= 256)
+#endif
+    for (int f = 0; f < n_features; ++f) {
+        std::vector<std::pair<float, int>> fvals;
+        fvals.reserve(sample_indices.size());
+        for (int idx : sample_indices)
+            fvals.push_back({X[idx][f], y[idx]});
+        std::sort(fvals.begin(), fvals.end());
+
+        std::map<int,int> left_counts, right_counts;
+        for (const auto &[v, l] : fvals) right_counts[l]++;
+
+        int left_size = 0, right_size = static_cast<int>(fvals.size());
+        float local_gain   = -std::numeric_limits<float>::infinity();
+        float local_thresh = 0.0f;
+
+        for (std::size_t i = 0; i + 1 < fvals.size(); ++i) {
+            int lbl = fvals[i].second;
+            left_counts[lbl]++;
+            right_counts[lbl]--;
+            if (right_counts[lbl] == 0) right_counts.erase(lbl);
+            ++left_size; --right_size;
+
+            if (fvals[i].first == fvals[i + 1].first) continue;
+            if (left_size  < min_samples_leaf_)        continue;
+            if (right_size < min_samples_leaf_)        continue;
+
+            float thresh = 0.5f * (fvals[i].first + fvals[i + 1].first);
+            float n      = static_cast<float>(sample_indices.size());
+            float gain   = parent_gini
+                         - (static_cast<float>(left_size)  / n) * giniFromCounts(left_counts,  left_size)
+                         - (static_cast<float>(right_size) / n) * giniFromCounts(right_counts, right_size);
+            if (gain > local_gain) { local_gain = gain; local_thresh = thresh; }
+        }
+        f_gain[f]   = local_gain;
+        f_thresh[f] = local_thresh;
+    }
+
+    // Serial reduction — pick the best feature across all f_gain slots.
+    float best_gain = -std::numeric_limits<float>::infinity();
+    for (int f = 0; f < n_features; ++f) {
+        if (f_gain[f] > best_gain) {
+            best_gain   = f_gain[f];
+            best_feat   = f;
+            best_thresh = f_thresh[f];
+        }
+    }
+    return best_feat != -1;
+}
+
+// ---------------------------------------------------------------------------
+// buildNode — recursive builder kept for compatibility, not used in M2 path
+// ---------------------------------------------------------------------------
+int DecisionTree::buildNode(const std::vector<std::vector<float>> &X,
+                            const std::vector<int> &sample_indices,
+                            const std::vector<int> &y,
+                            int depth)
+{
+    if (sample_indices.empty())
+        throw std::runtime_error("buildNode: empty sample_indices");
+
+    std::vector<int> labels;
+    labels.reserve(sample_indices.size());
+    for (int idx : sample_indices) labels.push_back(y[idx]);
+
+    int node_idx = static_cast<int>(nodes_.size());
     nodes_.emplace_back();
-
-    // Initialise fields that are valid for every node type.
     nodes_[node_idx].sample_count = static_cast<int>(sample_indices.size());
     nodes_[node_idx].gini         = computeGini(labels);
     nodes_[node_idx].label        = majorityLabel(labels);
 
-    // --- Leaf conditions ---
-    bool is_pure      = (nodes_[node_idx].gini < 1e-9f);
-    bool too_few      = (nodes_[node_idx].sample_count < 2 * min_samples_leaf_);
-    bool at_max_depth = (depth >= max_depth_);
-
-    if (is_pure || too_few || at_max_depth) {
+    if (nodes_[node_idx].gini < 1e-9f ||
+        nodes_[node_idx].sample_count < 2 * min_samples_leaf_ ||
+        depth >= max_depth_) {
         nodes_[node_idx].is_leaf = true;
         return node_idx;
     }
 
-    // --- Find the best (feature, threshold) split ---
-    // *** Milestone 2: replace this block with a GPU histogram kernel call. ***
-
-    int   n_features  = static_cast<int>(X[0].size());
-    int   n           = static_cast<int>(sample_indices.size());
-    float best_gain   = -std::numeric_limits<float>::infinity();
-    int   best_feat   = -1;
-    float best_thresh = 0.0f;
-
-    // Total class counts at this node — used to initialise the right-side
-    // counts before each feature scan.
-    std::vector<int> total_cnt(n_classes_, 0);
-    for (int idx : sample_indices)
-        total_cnt[y[idx]]++;
-
-    // Reusable buffers for the incremental scan (avoids per-feature allocation).
-    std::vector<int> left_cnt(n_classes_);
-    std::vector<int> right_cnt(n_classes_);
-    std::vector<int> sorted_active;
-    sorted_active.reserve(n);
-
-    for (int f = 0; f < n_features; ++f) {
-        // --- Optimisation 1: filter the presorted column to active samples ---
-        // sorted_indices_[f] is globally sorted ascending by X[i][f].
-        // We iterate it once (O(N_total)) and keep only active samples,
-        // giving us the node's samples already in sorted order — no re-sort.
-        sorted_active.clear();
-        for (int idx : sorted_indices_[f]) {
-            if (active_mask[idx])
-                sorted_active.push_back(idx);
-        }
-
-        // --- Optimisation 2: incremental Gini scan ---
-        // Initialise: all samples on the right, none on the left.
-        std::fill(left_cnt.begin(),  left_cnt.end(),  0);
-        right_cnt = total_cnt;
-        int n_left = 0, n_right = n;
-
-        for (int i = 0; i < n - 1; ++i) {
-            int   idx = sorted_active[i];
-            int   lbl = y[idx];
-
-            // Move sample i from right to left.
-            left_cnt[lbl]++;
-            right_cnt[lbl]--;
-            n_left++;
-            n_right--;
-
-            // Only evaluate a split at value boundaries (skip ties).
-            float val_curr = X[idx][f];
-            float val_next = X[sorted_active[i + 1]][f];
-            if (val_curr == val_next)
-                continue;
-
-            // Enforce minimum leaf size.
-            if (n_left  < min_samples_leaf_) continue;
-            if (n_right < min_samples_leaf_) continue;
-
-            // Gini for left child — O(K), no array rebuild.
-            float g_left = 1.0f;
-            for (int k = 0; k < n_classes_; ++k) {
-                float p = static_cast<float>(left_cnt[k]) / n_left;
-                g_left -= p * p;
-            }
-            // Gini for right child — O(K).
-            float g_right = 1.0f;
-            for (int k = 0; k < n_classes_; ++k) {
-                float p = static_cast<float>(right_cnt[k]) / n_right;
-                g_right -= p * p;
-            }
-
-            // Weighted Gini gain.
-            float gain = nodes_[node_idx].gini
-                       - (static_cast<float>(n_left)  / n) * g_left
-                       - (static_cast<float>(n_right) / n) * g_right;
-
-            if (gain > best_gain) {
-                best_gain   = gain;
-                best_feat   = f;
-                best_thresh = 0.5f * (val_curr + val_next);
-            }
-        }
-    }
-
-    // No split improved impurity — make a leaf.
-    if (best_feat == -1) {
+    int bf = -1; float bt = 0.0f;
+    if (!findBestSplitForNode(X, sample_indices, y, bf, bt)) {
         nodes_[node_idx].is_leaf = true;
         return node_idx;
     }
 
-    // --- Partition sample indices using the best split ---
-    std::vector<int> left_indices, right_indices;
+    std::vector<int> left_idx, right_idx;
     for (int idx : sample_indices) {
-        if (X[idx][best_feat] <= best_thresh) left_indices.push_back(idx);
-        else                                   right_indices.push_back(idx);
+        if (X[idx][bf] <= bt) left_idx.push_back(idx);
+        else                   right_idx.push_back(idx);
+    }
+    if (left_idx.empty() || right_idx.empty()) {
+        nodes_[node_idx].is_leaf = true;
+        return node_idx;
     }
 
-    // Store split parameters on the node before recursing.
-    nodes_[node_idx].feature_index = best_feat;
-    nodes_[node_idx].threshold     = best_thresh;
-
-    // Build child active masks by setting/clearing entries for this split.
-    // We reuse the parent mask pattern: copy it, then deactivate the samples
-    // that go to the other side.
-    std::vector<uint8_t> left_mask  = active_mask;
-    std::vector<uint8_t> right_mask = active_mask;
-    for (int idx : left_indices)  right_mask[idx] = 0;
-    for (int idx : right_indices) left_mask[idx]  = 0;
-
-    // Recurse.  IMPORTANT: nodes_ may reallocate during recursion.
-    // Use nodes_[node_idx] (index) not a stored Node& after this point.
-    int left_child  = buildNode(X, left_indices,  y, depth + 1, left_mask);
-    int right_child = buildNode(X, right_indices, y, depth + 1, right_mask);
-
-    // Re-index after potential reallocation.
-    nodes_[node_idx].left_child  = left_child;
-    nodes_[node_idx].right_child = right_child;
-
+    nodes_[node_idx].feature_index = bf;
+    nodes_[node_idx].threshold     = bt;
+    int lc = buildNode(X, left_idx,  y, depth + 1);
+    int rc = buildNode(X, right_idx, y, depth + 1);
+    nodes_[node_idx].left_child  = lc;
+    nodes_[node_idx].right_child = rc;
     return node_idx;
 }
 
 // ---------------------------------------------------------------------------
 // predict
 // ---------------------------------------------------------------------------
+int DecisionTree::predict(const std::vector<float> &sample) const
+{
+    if (nodes_.empty()) throw std::runtime_error("predict: tree not trained");
 
-int DecisionTree::predict(const std::vector<float>& sample) const {
-    if (nodes_.empty())
-        throw std::runtime_error("DecisionTree::predict: tree has not been trained");
-
-    int idx = 0; // start at root (always nodes_[0])
+    int idx = 0;
     while (!nodes_[idx].is_leaf) {
-        const Node& node = nodes_[idx];
+        const Node &node = nodes_[idx];
+        if (node.feature_index < 0 ||
+            static_cast<std::size_t>(node.feature_index) >= sample.size())
+            throw std::runtime_error("predict: sample too narrow for tree");
+        if (node.left_child < 0 || node.right_child < 0)
+            throw std::runtime_error("predict: invalid child index");
         idx = (sample[node.feature_index] <= node.threshold)
-                  ? node.left_child
-                  : node.right_child;
+              ? node.left_child : node.right_child;
     }
     return nodes_[idx].label;
 }
