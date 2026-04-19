@@ -323,6 +323,7 @@ int main()
         {"Wine",          "../data/wine.csv",          5, 1},
         {"Breast Cancer", "../data/breast_cancer.csv", 7, 2},
         {"Banknote Auth", "../data/banknote.csv",      5, 1}
+        {"Synthetic",     "../data/synthetic.csv",     8, 1}
     };
 
     std::vector<BenchmarkResult> results;
