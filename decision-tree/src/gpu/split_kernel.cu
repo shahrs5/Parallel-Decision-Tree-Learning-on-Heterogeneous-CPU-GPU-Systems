@@ -149,16 +149,8 @@ __global__ void findBestSplitKernel(
     if (bin >= n_bins) return;
 
     // Build prefix sums [0..bin] into left_counts.
+
     int left_counts[MAX_CLASSES]  = {0};
-    int right_counts[MAX_CLASSES] = {0};
-
-    // Total counts over all bins for this feature.
-        const int* feat_hist = d_hist + feat * n_bins * n_classes;
-        for (int b = 0; b < n_bins; ++b)
-            for (int c = 0; c < n_classes; ++c)
-                right_counts[c] += feat_hist[b * n_classes + c];
-
-            int left_counts[MAX_CLASSES]  = {0};
     int right_counts[MAX_CLASSES] = {0};
 
     const int* feat_hist = d_hist + feat * n_bins * n_classes;
@@ -336,10 +328,7 @@ extern "C" void findBestSplitGPU(
        );
     }
 
-    // Compute quantile bin edges.
-    #include <algorithm>  // make sure this is included
-
-// Compute quantile bin edges.
+   // Compute quantile bin edges.
    for (int f = 0; f < n_features; ++f) {
         float* vals = new float[n_active];
         for (int i = 0; i < n_active; ++i)
