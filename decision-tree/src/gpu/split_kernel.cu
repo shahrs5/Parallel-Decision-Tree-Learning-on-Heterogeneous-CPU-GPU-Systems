@@ -33,6 +33,7 @@
 #include <device_launch_parameters.h>
 #include <float.h>
 #include <stdio.h>
+#include <algorithm>
 
 #include "split_kernel.cuh"
 
@@ -148,39 +149,32 @@ __global__ void findBestSplitKernel(
     if (bin >= n_bins) return;
 
     // Build prefix sums [0..bin] into left_counts.
+
     int left_counts[MAX_CLASSES]  = {0};
     int right_counts[MAX_CLASSES] = {0};
 
-    // Total counts over all bins for this feature.
     const int* feat_hist = d_hist + feat * n_bins * n_classes;
+
+    // total counts for feature
     for (int b = 0; b < n_bins; ++b)
         for (int c = 0; c < n_classes; ++c)
             right_counts[c] += feat_hist[b * n_classes + c];
 
-    // Sweep left-to-right: each thread computes the prefix up to its bin.
-    int left_total = 0;
+    // compute left side
+    int left_total = 0; 
     for (int b = 0; b <= bin; ++b)
         for (int c = 0; c < n_classes; ++c) {
-            left_counts[c]  += feat_hist[b * n_classes + c];
-            right_counts[c] -= feat_hist[b * n_classes + c];
-            if (b <= bin) left_total += feat_hist[b * n_classes + c];
+            int val = feat_hist[b * n_classes + c];
+            left_counts[c] += val;
+            left_total += val;
         }
-    // Undo the double-counting from the nested loop above.
-    // Re-compute cleanly:
-    for (int c = 0; c < n_classes; ++c) left_counts[c] = 0;
-    left_total = 0;
-    for (int b = 0; b <= bin; ++b)
-        for (int c = 0; c < n_classes; ++c) {
-            left_counts[c]  += feat_hist[b * n_classes + c];
-            left_total      += feat_hist[b * n_classes + c];
-        }
-    for (int c = 0; c < n_classes; ++c) right_counts[c] = 0;
+
+    // compute right side from totals
     int right_total = 0;
-    for (int b = bin + 1; b < n_bins; ++b)
-        for (int c = 0; c < n_classes; ++c) {
-            right_counts[c] += feat_hist[b * n_classes + c];
-            right_total     += feat_hist[b * n_classes + c];
-        }
+    for (int c = 0; c < n_classes; ++c) {
+        right_counts[c] -= left_counts[c];
+        right_total += right_counts[c];
+    }
 
     float gain = -FLT_MAX;
     if (left_total >= min_samples_leaf && right_total >= min_samples_leaf) {
@@ -285,6 +279,7 @@ extern "C" void freeGPUData(float* d_X, int* d_y)
 extern "C" void findBestSplitGPU(
     const float* d_X,
     const int*   d_y,
+    const float* h_X,   
     const int*   h_indices,
     int          n_active,
     int          n_features,
@@ -323,35 +318,37 @@ extern "C" void findBestSplitGPU(
     // Download the active feature values for bin-edge estimation.
     // Only download n_active × n_features values — much smaller than full X.
     float* h_X_active = new float[(size_t)n_active * n_features];
+
     for (int i = 0; i < n_active; ++i) {
-        int sample = h_indices[i];
-        CUDA_CHECK(cudaMemcpy(
-            h_X_active + (size_t)i * n_features,
-            d_X + (size_t)sample * n_features,
-            n_features * sizeof(float),
-            cudaMemcpyDeviceToHost));
+       int sample = h_indices[i];
+       memcpy(
+           h_X_active + (size_t)i * n_features,
+           h_X + (size_t)sample * n_features,
+           n_features * sizeof(float)
+       );
     }
 
-    // Compute quantile bin edges.
-    for (int f = 0; f < n_features; ++f) {
+   // Compute quantile bin edges.
+   for (int f = 0; f < n_features; ++f) {
         float* vals = new float[n_active];
         for (int i = 0; i < n_active; ++i)
-            vals[i] = h_X_active[(size_t)i * n_features + f];
-
-        // Quick-sort approximation: insertion sort for small n_active.
-        for (int i = 1; i < n_active; ++i) {
-            float key = vals[i];
-            int j = i - 1;
-            while (j >= 0 && vals[j] > key) { vals[j + 1] = vals[j]; --j; }
-            vals[j + 1] = key;
-        }
+           vals[i] = h_X_active[(size_t)i * n_features + f];
 
         float* edges = h_bin_edges + f * n_bins;
+
+        // copy once so nth_element doesn't corrupt future selections
+        float* temp = new float[n_active];
+        memcpy(temp, vals, n_active * sizeof(float));
+
         for (int b = 0; b < n_bins; ++b) {
-            int q = (int)(((float)(b + 1) / (float)n_bins) * n_active);
-            if (q >= n_active) q = n_active - 1;
-            edges[b] = vals[q];
+          int q = (int)(((float)(b + 1) / (float)n_bins) * n_active);
+          if (q >= n_active) q = n_active - 1;
+
+          std::nth_element(temp, temp + q, temp + n_active);
+          edges[b] = temp[q];
         }
+
+        delete[] temp;
         delete[] vals;
     }
     delete[] h_X_active;

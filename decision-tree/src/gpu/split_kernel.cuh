@@ -30,6 +30,7 @@ void freeGPUData(float* d_X, int* d_y);
 void findBestSplitGPU(
     const float* d_X,
     const int*   d_y,
+    const float* h_X, 
     const int*   h_indices,   // CPU array — copied to GPU inside this call
     int          n_active,
     int          n_features,
