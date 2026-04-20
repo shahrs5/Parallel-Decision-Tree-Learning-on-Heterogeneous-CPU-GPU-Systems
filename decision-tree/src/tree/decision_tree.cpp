@@ -188,25 +188,29 @@ void DecisionTree::trainLevelWise(const std::vector<std::vector<float>> &X,
             bool  found = false;
 
 #ifdef USE_CUDA
-            // GPU path (Person 2 kernels, called by Person 3).
-            // Detect number of distinct classes in this node.
-            std::map<int,int> cls_map;
-            for (int l : labels) cls_map[l]++;
-            int n_classes = static_cast<int>(cls_map.size());
+            if (use_gpu_) {
+                // GPU histogram path (Person 2 kernels, Person 3 integration).
+                std::map<int,int> cls_map;
+                for (int l : labels) cls_map[l]++;
+                int n_classes = static_cast<int>(cls_map.size());
 
-            findBestSplitGPU(
-                d_X_, d_y_,
-                X_flat_.data(), y.data(),
-                sidx.data(), static_cast<int>(sidx.size()),
-                n_features_,
-                /*n_bins=*/32,
-                n_classes,
-                gini,
-                min_samples_leaf_,
-                bf, bt);
-            found = (bf >= 0);
+                findBestSplitGPU(
+                    d_X_, d_y_,
+                    X_flat_.data(), y.data(),
+                    sidx.data(), static_cast<int>(sidx.size()),
+                    n_features_,
+                    /*n_bins=*/32,
+                    n_classes,
+                    gini,
+                    min_samples_leaf_,
+                    bf, bt);
+                found = (bf >= 0);
+            } else {
+                // CPU exact path (forced via setUseGPU(false) for comparison).
+                found = findBestSplitForNode(X, sidx, y, bf, bt);
+            }
 #else
-            // CPU path (histogram-based exact split — Milestone 1 code).
+            // CPU path (no CUDA build).
             found = findBestSplitForNode(X, sidx, y, bf, bt);
 #endif
             best_feats[ni]      = bf;

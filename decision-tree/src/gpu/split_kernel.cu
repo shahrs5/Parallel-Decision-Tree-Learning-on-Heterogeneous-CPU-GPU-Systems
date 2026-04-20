@@ -52,7 +52,7 @@
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
-static const int MAX_CLASSES = 16;   // max number of distinct class labels
+static const int MAX_CLASSES = 64;   // max number of distinct class labels
 static const int BLOCK_SIZE  = 256;  // threads per block for histogram kernel
 
 static bool  g_force_batch_mode = false;

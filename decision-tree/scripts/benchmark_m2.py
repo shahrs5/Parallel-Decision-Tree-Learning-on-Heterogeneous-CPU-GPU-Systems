@@ -314,37 +314,37 @@ def exp_accuracy_comparison():
 def exp_cpp_gpu_results():
     print("[Exp 5] Actual C++ exe GPU benchmark results (RTX 4060) ...")
 
-    datasets  = ["Iris", "Wine", "Breast\nCancer", "Banknote\nAuth", "Synthetic\n(6k)"]
-    samples   = [150,    178,     569,              1372,             6000]
-    seq_ms    = [1.99,   2.23,    5.97,             4.12,             81.4]
-    par_ms    = [1.79,   2.34,    5.73,             9.88,             80.0]
+    # GPU-path (histogram kernel) training: seq=1 thread, par=16 threads
+    datasets  = ["Iris", "Wine", "Breast\nCancer", "Banknote\nAuth", "Synthetic\n(6k)", "Synthetic\n(200k)"]
+    samples   = [150,    178,     569,              1372,             6000,              200000]
+    seq_ms    = [2.62,   2.65,    6.95,             4.94,             91.6,              1880]
+    par_ms    = [1.85,   2.77,    6.53,             4.96,             92.3,              1961]
     speedups  = [s/p for s, p in zip(seq_ms, par_ms)]
 
-    print(f"  {'Dataset':18s}  {'Samples':>8}  {'Seq(ms)':>8}  {'Par(ms)':>8}  {'Speedup':>8}")
+    print(f"  {'Dataset':18s}  {'Samples':>8}  {'Seq(ms)':>9}  {'Par(ms)':>9}  {'Speedup':>8}")
     for d, n, s, p, sp in zip(datasets, samples, seq_ms, par_ms, speedups):
         label = d.replace("\n", " ")
-        print(f"  {label:18s}  {n:8d}  {s:8.2f}  {p:8.2f}  {sp:8.2f}x")
+        print(f"  {label:18s}  {n:8d}  {s:9.2f}  {p:9.2f}  {sp:8.2f}x")
 
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
 
     x   = np.arange(len(datasets))
     w   = 0.35
-    ax1.bar(x - w/2, seq_ms, w, label="Sequential",   color="steelblue")
-    ax1.bar(x + w/2, par_ms, w, label="Parallel (OpenMP)", color="darkorange")
-    ax1.set_xticks(x); ax1.set_xticklabels(datasets, fontsize=9)
+    ax1.bar(x - w/2, seq_ms, w, label="Sequential (1 thread)",   color="steelblue")
+    ax1.bar(x + w/2, par_ms, w, label="Parallel (16 threads, OpenMP)", color="darkorange")
+    ax1.set_xticks(x); ax1.set_xticklabels(datasets, fontsize=8)
     ax1.set_ylabel("Training time (ms)")
-    ax1.set_title("C++ Decision Tree Training Time\n(GPU histogram split finding, RTX 4060)")
+    ax1.set_title("GPU-Path Training Time: Seq vs OpenMP\n(both paths use GPU histogram kernel, RTX 4060)")
     ax1.legend(); ax1.grid(axis="y", alpha=0.4)
+    ax1.set_yscale("log")
 
     colors = ["green" if sp >= 1.0 else "crimson" for sp in speedups]
     ax2.bar(x, speedups, color=colors, alpha=0.8)
     ax2.axhline(1.0, color="black", linestyle="--", linewidth=1)
-    ax2.set_xticks(x); ax2.set_xticklabels(datasets, fontsize=9)
+    ax2.set_xticks(x); ax2.set_xticklabels(datasets, fontsize=8)
     ax2.set_ylabel("Speedup (Seq / Par)")
-    ax2.set_title("OpenMP Parallel Speedup per Dataset\n(GPU histogram path active)")
+    ax2.set_title("OpenMP Speedup (GPU histogram path active)")
     ax2.grid(axis="y", alpha=0.4)
-
-    # Annotate speedup values
     for i, sp in enumerate(speedups):
         ax2.text(i, sp + 0.02, f"{sp:.2f}x", ha="center", va="bottom", fontsize=9)
 
@@ -353,6 +353,77 @@ def exp_cpp_gpu_results():
     plt.close()
     print("  Saved: results/gpu_benchmark.png\n")
     return datasets, seq_ms, par_ms, speedups
+
+
+# ---------------------------------------------------------------------------
+# Experiment 8: CPU Exact vs GPU Histogram — direct 3-way comparison
+# Numbers from decision_tree.exe CPU vs GPU comparison section (April 2026).
+# ---------------------------------------------------------------------------
+def exp_cpu_vs_gpu_comparison():
+    print("[Exp 8] CPU exact vs GPU histogram — 3-way comparison ...")
+
+    labels   = ["Iris\n(150)", "Wine\n(178)", "BC\n(569)",
+                "Banknote\n(1.4k)", "Synth\n(6k)", "Synth\n(200k)", "Synth\n(1M)"]
+    samples  = [150, 178, 569, 1372, 6000, 200000, 1000000]
+    cpu_seq  = [0.72,  0.45,   3.80,   1.65,   56.61,  2203.17, 145163.0]
+    cpu_par  = [0.11,  0.39,   3.71,   1.36,   55.71,  2170.53, 144433.0]
+    gpu_ms   = [2.92,  4.16,   9.85,   7.34,  117.82,  1960.52, 105605.0]
+    accuracy = [0.7333, 0.8000, 0.9558, 0.9672, 0.8008, 0.8778, 0.5937]
+    gpu_sp   = [cs/g for cs, g in zip(cpu_seq, gpu_ms)]
+
+    print(f"  {'Dataset':18s}  {'CPU Seq':>10}  {'CPU Par':>10}  {'GPU':>10}  {'GPU Speedup':>12}  {'Acc':>6}")
+    for lb, cs, cp, g, sp, acc in zip(labels, cpu_seq, cpu_par, gpu_ms, gpu_sp, accuracy):
+        name = lb.replace("\n", " ")
+        print(f"  {name:18s}  {cs:10.2f}  {cp:10.2f}  {g:10.2f}  {sp:12.2f}x  {acc:.4f}")
+
+    fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+
+    x = np.arange(len(labels))
+    w = 0.28
+
+    # Panel 1: Training time (log scale)
+    axes[0].bar(x - w,   cpu_seq, w, label="CPU Sequential\n(exact split)", color="steelblue")
+    axes[0].bar(x,       cpu_par, w, label="CPU Parallel\n(16 threads, exact)", color="darkorange")
+    axes[0].bar(x + w,   gpu_ms,  w, label="GPU Histogram\n(32 bins, RTX 4060)", color="green")
+    axes[0].set_xticks(x); axes[0].set_xticklabels(labels, fontsize=7)
+    axes[0].set_ylabel("Training time (ms)")
+    axes[0].set_yscale("log")
+    axes[0].set_title("Training Time: CPU Exact vs GPU Histogram\n(log scale)")
+    axes[0].legend(fontsize=7); axes[0].grid(axis="y", alpha=0.4)
+
+    # Panel 2: GPU speedup vs CPU sequential
+    colors = ["green" if sp >= 1.0 else "crimson" for sp in gpu_sp]
+    axes[1].bar(x, gpu_sp, color=colors, alpha=0.85)
+    axes[1].axhline(1.0, color="black", linestyle="--", linewidth=1.2, label="Break-even")
+    axes[1].set_xticks(x); axes[1].set_xticklabels(labels, fontsize=7)
+    axes[1].set_ylabel("Speedup (CPU Seq / GPU)")
+    axes[1].set_title("GPU Speedup vs CPU Sequential\n(>1.0 = GPU wins)")
+    axes[1].legend(fontsize=8); axes[1].grid(axis="y", alpha=0.4)
+    for i, sp in enumerate(gpu_sp):
+        axes[1].text(i, sp + 0.01, f"{sp:.2f}x", ha="center", va="bottom", fontsize=7)
+
+    # Panel 3: GPU speedup vs n_samples (line chart — shows crossover)
+    axes[2].plot(samples, gpu_sp, "D-", color="green", linewidth=2, markersize=7)
+    axes[2].axhline(1.0, color="black", linestyle="--", linewidth=1.2)
+    axes[2].fill_between(samples, [1.0]*len(samples), gpu_sp,
+                         where=[sp >= 1.0 for sp in gpu_sp],
+                         alpha=0.15, color="green", label="GPU wins")
+    axes[2].fill_between(samples, gpu_sp, [1.0]*len(samples),
+                         where=[sp < 1.0 for sp in gpu_sp],
+                         alpha=0.15, color="crimson", label="CPU wins")
+    axes[2].set_xscale("log")
+    axes[2].set_xlabel("Dataset size (samples, log scale)")
+    axes[2].set_ylabel("GPU Speedup vs CPU Sequential")
+    axes[2].set_title("GPU Speedup vs Dataset Size\n(crossover ~100k–200k samples)")
+    axes[2].legend(fontsize=8); axes[2].grid(True, alpha=0.4)
+    for s, sp in zip(samples, gpu_sp):
+        axes[2].annotate(f"{sp:.2f}x", (s, sp), textcoords="offset points",
+                         xytext=(0, 8), ha="center", fontsize=7)
+
+    plt.tight_layout()
+    plt.savefig("results/cpu_vs_gpu_comparison.png", dpi=150)
+    plt.close()
+    print("  Saved: results/cpu_vs_gpu_comparison.png\n")
 
 
 # ---------------------------------------------------------------------------
@@ -482,11 +553,12 @@ if __name__ == "__main__":
 
     exp_scalability()
     exp_utilization_breakdown()
+    exp_cpu_vs_gpu_comparison()
 
     print("=" * 60)
     print("All results saved to results/")
     print("Plots: split_speedup.png, features_speedup.png,")
     print("       levelwise_depth.png, accuracy_comparison.png,")
     print("       gpu_benchmark.png, scalability.png,")
-    print("       utilization_breakdown.png")
+    print("       utilization_breakdown.png, cpu_vs_gpu_comparison.png")
     print("CSVs:  split_timing.csv, levelwise_timing.csv")

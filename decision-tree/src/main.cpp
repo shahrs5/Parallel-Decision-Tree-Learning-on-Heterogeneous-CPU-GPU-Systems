@@ -374,11 +374,12 @@ int main()
 
     struct DatasetConfig { std::string name, path; int depth, leaf; };
     std::vector<DatasetConfig> datasets = {
-        {"Iris",          "../data/iris.csv",          5, 1},
-        {"Wine",          "../data/wine.csv",          5, 1},
-        {"Breast Cancer", "../data/breast_cancer.csv", 7, 2},
-        {"Banknote Auth", "../data/banknote.csv",      5, 1},
-        {"Synthetic",     "../data/synthetic.csv",     8, 1}
+        {"Iris",           "../data/iris.csv",           5,  1},
+        {"Wine",           "../data/wine.csv",           5,  1},
+        {"Breast Cancer",  "../data/breast_cancer.csv",  7,  2},
+        {"Banknote Auth",  "../data/banknote.csv",        5,  1},
+        {"Synthetic (6k)", "../data/synthetic.csv",       8,  1},
+        {"Synthetic 200k", "../data/synthetic_200k.csv",  8,  5},
     };
 
     std::vector<BenchmarkResult> results;
@@ -522,6 +523,103 @@ int main()
         std::cout << "  Avg overhead / node      : " << overhead_ms   / s.n_calls << " ms\n";
     }
 #endif
+
+#ifdef USE_CUDA
+    // ---- CPU vs GPU Comparison on Large Datasets ----
+    // Runs each dataset THREE ways in the same binary:
+    //   (a) CPU sequential (setUseGPU(false), 1 thread)
+    //   (b) CPU parallel   (setUseGPU(false), all threads via OpenMP)
+    //   (c) GPU histogram  (setUseGPU(true),  all threads)
+    // This isolates the GPU kernel benefit from OpenMP thread benefit.
+    printSection("CPU vs GPU Comparison -- Large Dataset Scaling");
+
+    struct ScaleConfig { std::string name, path; int depth, leaf; };
+    std::vector<ScaleConfig> scale_datasets = {
+        {"Iris",           "../data/iris.csv",           5,  1},
+        {"Wine",           "../data/wine.csv",           5,  1},
+        {"Breast Cancer",  "../data/breast_cancer.csv",  7,  2},
+        {"Banknote Auth",  "../data/banknote.csv",        5,  1},
+        {"Synthetic (6k)", "../data/synthetic.csv",       8,  1},
+        {"Synthetic 200k", "../data/synthetic_200k.csv",  8,  5},
+    };
+
+    std::cout << std::left
+              << std::setw(24) << "Dataset"
+              << std::setw(12) << "Samples"
+              << std::setw(14) << "CPU_Seq(ms)"
+              << std::setw(14) << "CPU_Par(ms)"
+              << std::setw(14) << "GPU(ms)"
+              << std::setw(12) << "CPU_Speedup"
+              << std::setw(12) << "GPU_Speedup"
+              << std::setw(10) << "Accuracy"
+              << "\n" << std::string(112, '-') << "\n";
+
+    for (const auto &d : scale_datasets) {
+        if (!fileExists(d.path)) {
+            std::cout << "  [SKIP] " << d.path << "\n";
+            continue;
+        }
+
+        std::vector<std::vector<float>> X; std::vector<int> y;
+        int n = loadCSV(d.path, X, y);
+        if (n <= 0) { std::cout << "  [FAIL] " << d.path << "\n"; continue; }
+
+        std::vector<std::vector<float>> X_tr, X_te;
+        std::vector<int> y_tr, y_te;
+        trainTestSplit(X, y, 0.2f, X_tr, y_tr, X_te, y_te);
+
+        auto timeTrain = [&](bool gpu, int threads) -> double {
+#ifdef USE_OPENMP
+            omp_set_num_threads(threads);
+#endif
+            DecisionTree t(d.depth, d.leaf);
+            t.setUseGPU(gpu);
+            auto t0 = std::chrono::high_resolution_clock::now();
+            t.train(X_tr, y_tr);
+            return std::chrono::duration<double, std::milli>(
+                   std::chrono::high_resolution_clock::now() - t0).count();
+        };
+
+        int max_thr = 1;
+#ifdef USE_OPENMP
+        max_thr = omp_get_max_threads();
+#endif
+
+        double cpu_seq = timeTrain(false, 1);
+        double cpu_par = timeTrain(false, max_thr);
+        double gpu_ms  = timeTrain(true,  max_thr);
+
+        // Accuracy on GPU path
+        DecisionTree t_acc(d.depth, d.leaf);
+        t_acc.setUseGPU(true);
+#ifdef USE_OPENMP
+        omp_set_num_threads(max_thr);
+#endif
+        t_acc.train(X_tr, y_tr);
+        std::vector<int> preds;
+        for (const auto &s : X_te) preds.push_back(t_acc.predict(s));
+        float acc = accuracy(y_te, preds);
+
+        double cpu_sp = (cpu_par > 0) ? cpu_seq / cpu_par : 1.0;
+        double gpu_sp = (gpu_ms  > 0) ? cpu_seq / gpu_ms  : 1.0;
+
+        std::cout << std::fixed << std::setprecision(2) << std::left
+                  << std::setw(24) << d.name
+                  << std::setw(12) << n
+                  << std::setw(14) << cpu_seq
+                  << std::setw(14) << cpu_par
+                  << std::setw(14) << gpu_ms
+                  << std::setw(12) << cpu_sp
+                  << std::setw(12) << gpu_sp
+                  << std::fixed << std::setprecision(4)
+                  << std::setw(10) << acc
+                  << "\n";
+    }
+
+#ifdef USE_OPENMP
+    omp_set_num_threads(omp_get_max_threads());
+#endif
+#endif // USE_CUDA
 
     return (s1 && s2 && s3) ? 0 : 1;
 }

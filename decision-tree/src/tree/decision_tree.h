@@ -33,6 +33,11 @@ public:
 
     const std::vector<Node> &nodes() const { return nodes_; }
 
+    // Runtime GPU toggle (only meaningful when compiled with USE_CUDA).
+    // Set to false to force the CPU exact-split path within a GPU build,
+    // enabling direct CPU-vs-GPU timing comparison in the same binary.
+    void setUseGPU(bool v) { use_gpu_ = v; }
+
     static float computeGini(const std::vector<int> &labels);
     static int   majorityLabel(const std::vector<int> &labels);
 
@@ -43,8 +48,9 @@ private:
         int depth;
     };
 
-    int max_depth_;
-    int min_samples_leaf_;
+    int  max_depth_;
+    int  min_samples_leaf_;
+    bool use_gpu_ = true;   // runtime toggle: CPU exact vs GPU histogram
     std::vector<Node> nodes_;
 
     // Flattened row-major feature matrix kept for GPU upload (Person 3).
