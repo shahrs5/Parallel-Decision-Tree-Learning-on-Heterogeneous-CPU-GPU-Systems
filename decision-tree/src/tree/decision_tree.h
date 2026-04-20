@@ -2,75 +2,75 @@
 
 #include <string>
 #include <vector>
-
+#include <utility>
 #include "node.h"
 
 // ---------------------------------------------------------------------------
 // DecisionTree — CART-style binary decision tree classifier.
 //
-// Milestone 1 (this file): sequential training with Gini impurity.
-// Milestone 2: split evaluation will be offloaded to the GPU.
-//   The CPU loop in buildNode() will be replaced by a call to a host wrapper
-//   around the CUDA kernel in src/gpu/split_kernel.cu.  The node allocation
-//   pattern (nodes_ vector + index bookkeeping) stays unchanged.
-// Milestone 3: DecisionTree is used as-is inside a RandomForest ensemble.
-//   Each tree trains on a bootstrap sample of the data.
-//
-// Node storage: flat array-of-structs — see src/tree/node.h.
-//   Root is always nodes_[0].  Children are stored by index, not pointer,
-//   making the tree trivially serialisable and GPU-copyable.
+// Milestone 1: sequential training with Gini impurity (unchanged).
+// Milestone 2 (Person 3 — CPU-GPU Integration):
+//   - trainLevelWise() processes all nodes at the same depth in parallel
+//     via OpenMP when compiled with -DUSE_OPENMP (or -fopenmp).
+//   - When compiled with -DUSE_CUDA the inner findBestSplitForNode() call
+//     is replaced by findBestSplitGPU() from src/gpu/split_kernel.cuh.
+//     Feature data is uploaded once and stays GPU-resident; only the tiny
+//     (feature, threshold) result is transferred back per node.
+// Milestone 3: DecisionTree is reused as-is inside RandomForest.
 // ---------------------------------------------------------------------------
-class DecisionTree {
+class DecisionTree
+{
 public:
-    // max_depth:        stop splitting when this depth is reached.
-    // min_samples_leaf: each child must receive at least this many samples.
-    explicit DecisionTree(int max_depth       = 10,
+    explicit DecisionTree(int max_depth = 10,
                           int min_samples_leaf = 1);
 
-    // Train on feature matrix X and integer label vector y.
-    // X: [n_samples][n_features], all float.
-    // y: class labels, length n_samples.
-    void train(const std::vector<std::vector<float>>& X,
-               const std::vector<int>&                y);
+    ~DecisionTree();
 
-    // Predict the class label for a single feature vector.
-    int predict(const std::vector<float>& sample) const;
+    void train(const std::vector<std::vector<float>> &X,
+               const std::vector<int> &y);
 
-    // Read-only access to the node array.
-    // Milestone 2: use this to inspect/copy the tree structure to the GPU.
-    const std::vector<Node>& nodes() const { return nodes_; }
+    int predict(const std::vector<float> &sample) const;
 
-    // -----------------------------------------------------------------------
-    // Static utility functions
-    // -----------------------------------------------------------------------
+    const std::vector<Node> &nodes() const { return nodes_; }
 
-    // Compute Gini impurity for a set of class labels.
-    //
-    //   Gini = 1 - Σ_k  p_k²
-    //
-    // where p_k = (count of class k) / (total samples).
-    // Returns 0.0 for a pure node, approaches (1 - 1/K) for K equal classes.
-    static float computeGini(const std::vector<int>& labels);
-
-    // Return the most frequent label in the set (used for leaf prediction).
-    // Ties broken by lowest label value (deterministic, map-ordered).
-    static int majorityLabel(const std::vector<int>& labels);
+    static float computeGini(const std::vector<int> &labels);
+    static int   majorityLabel(const std::vector<int> &labels);
 
 private:
+    struct PendingNode {
+        int node_idx;
+        std::vector<int> sample_indices;
+        int depth;
+    };
+
     int max_depth_;
     int min_samples_leaf_;
-
-    // All tree nodes in BFS-like allocation order.  Root = nodes_[0].
     std::vector<Node> nodes_;
 
-    // Recursively build a node for the given subset of training samples.
-    // Returns the index of the newly created node in nodes_.
-    //
-    // Note on reallocation: nodes_.push_back() may invalidate references.
-    // Always use nodes_[idx] (index) rather than a stored reference after
-    // any recursive call that may push more nodes.
-    int buildNode(const std::vector<std::vector<float>>& X,
-                  const std::vector<int>&                sample_indices,
-                  const std::vector<int>&                y,
-                  int                                    depth);
+    // Flattened row-major feature matrix kept for GPU upload (Person 3).
+    // Populated in train(); reused across nodes so we upload once.
+    std::vector<float> X_flat_;   // [n_samples * n_features]
+    int n_samples_  = 0;
+    int n_features_ = 0;
+
+#ifdef USE_CUDA
+    float* d_X_ = nullptr;   // GPU-resident feature matrix
+    int*   d_y_ = nullptr;   // GPU-resident label array
+#endif
+
+    int  createEmptyNode();
+
+    bool findBestSplitForNode(const std::vector<std::vector<float>> &X,
+                              const std::vector<int> &sample_indices,
+                              const std::vector<int> &y,
+                              int   &best_feat,
+                              float &best_thresh) const;
+
+    void trainLevelWise(const std::vector<std::vector<float>> &X,
+                        const std::vector<int> &y);
+
+    int buildNode(const std::vector<std::vector<float>> &X,
+                  const std::vector<int> &sample_indices,
+                  const std::vector<int> &y,
+                  int depth);
 };
