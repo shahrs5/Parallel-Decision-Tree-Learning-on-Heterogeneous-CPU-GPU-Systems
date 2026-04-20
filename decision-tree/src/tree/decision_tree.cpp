@@ -196,7 +196,7 @@ void DecisionTree::trainLevelWise(const std::vector<std::vector<float>> &X,
 
             findBestSplitGPU(
                 d_X_, d_y_,
-                X_flat_.data(),
+                X_flat_.data(), y.data(),
                 sidx.data(), static_cast<int>(sidx.size()),
                 n_features_,
                 /*n_bins=*/32,

@@ -55,6 +55,25 @@
 static const int MAX_CLASSES = 16;   // max number of distinct class labels
 static const int BLOCK_SIZE  = 256;  // threads per block for histogram kernel
 
+static bool  g_force_batch_mode = false;
+static float g_total_kernel_ms  = 0.0f;
+static float g_total_call_ms    = 0.0f;
+static int   g_n_gpu_calls      = 0;
+
+extern "C" void setForceBatchMode(bool force) { g_force_batch_mode = force; }
+
+extern "C" void resetGPUCallStats() {
+    g_total_kernel_ms = 0.0f;
+    g_total_call_ms   = 0.0f;
+    g_n_gpu_calls     = 0;
+}
+
+extern "C" void getGPUCallStats(GPUCallStats* out) {
+    out->kernel_ms = g_total_kernel_ms;
+    out->total_ms  = g_total_call_ms;
+    out->n_calls   = g_n_gpu_calls;
+}
+
 // ---------------------------------------------------------------------------
 // Kernel 1: buildHistogramsKernel
 //
@@ -264,10 +283,28 @@ extern "C" void uploadDataToGPU(
     size_t X_bytes = (size_t)n_samples * n_features * sizeof(float);
     size_t y_bytes = (size_t)n_samples * sizeof(int);
 
-    CUDA_CHECK(cudaMalloc(d_X_out, X_bytes));
-    CUDA_CHECK(cudaMalloc(d_y_out, y_bytes));
-    CUDA_CHECK(cudaMemcpy(*d_X_out, h_X, X_bytes, cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(*d_y_out, h_y, y_bytes, cudaMemcpyHostToDevice));
+    // Check available GPU memory. Reserve 256 MB headroom for kernel workspace.
+    size_t free_mem = 0, total_mem = 0;
+    cudaMemGetInfo(&free_mem, &total_mem);
+    bool fits = !g_force_batch_mode &&
+                (free_mem > X_bytes + y_bytes + 256ULL * 1024 * 1024);
+
+    if (fits) {
+        CUDA_CHECK(cudaMalloc(d_X_out, X_bytes));
+        CUDA_CHECK(cudaMalloc(d_y_out, y_bytes));
+        CUDA_CHECK(cudaMemcpy(*d_X_out, h_X, X_bytes, cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(*d_y_out, h_y, y_bytes, cudaMemcpyHostToDevice));
+    } else {
+        // Batch mode: X is too large for GPU. Upload only y (labels are small).
+        // findBestSplitGPU detects d_X==nullptr and compacts active rows per node.
+        *d_X_out = nullptr;
+        CUDA_CHECK(cudaMalloc(d_y_out, y_bytes));
+        CUDA_CHECK(cudaMemcpy(*d_y_out, h_y, y_bytes, cudaMemcpyHostToDevice));
+        fprintf(stderr,
+            "[GPU] Feature matrix too large (%zu MB needed, %zu MB free). "
+            "Using per-node batch upload.\n",
+            (X_bytes + y_bytes) >> 20, free_mem >> 20);
+    }
 }
 
 extern "C" void freeGPUData(float* d_X, int* d_y)
@@ -279,7 +316,8 @@ extern "C" void freeGPUData(float* d_X, int* d_y)
 extern "C" void findBestSplitGPU(
     const float* d_X,
     const int*   d_y,
-    const float* h_X,   
+    const float* h_X,
+    const int*   h_y,
     const int*   h_indices,
     int          n_active,
     int          n_features,
@@ -295,10 +333,68 @@ extern "C" void findBestSplitGPU(
 
     if (n_active < 2 || n_classes > MAX_CLASSES) return;
 
-    // --- Upload indices ---
+    // Timing: wall time for the entire call
+    cudaEvent_t ev_call_start, ev_call_end;
+    cudaEvent_t ev_kern_start, ev_kern_end;
+    CUDA_CHECK(cudaEventCreate(&ev_call_start));
+    CUDA_CHECK(cudaEventCreate(&ev_call_end));
+    CUDA_CHECK(cudaEventCreate(&ev_kern_start));
+    CUDA_CHECK(cudaEventCreate(&ev_kern_end));
+    CUDA_CHECK(cudaEventRecord(ev_call_start));
+
+    // -----------------------------------------------------------------------
+    // Batch mode: d_X==nullptr means the full feature matrix didn't fit in GPU
+    // memory. Compact just the active rows onto the GPU for this node.
+    // -----------------------------------------------------------------------
+    float* d_X_batch = nullptr;
+    int*   d_y_batch = nullptr;
+    int*   d_idx_seq = nullptr;
+
+    const float* d_X_use = d_X;
+    const int*   d_y_use = d_y;
+
+    if (d_X == nullptr) {
+        float* h_X_compact = new float[(size_t)n_active * n_features];
+        int*   h_y_compact = new int[n_active];
+        int*   h_seq       = new int[n_active];
+
+        for (int i = 0; i < n_active; ++i) {
+            int s = h_indices[i];
+            memcpy(h_X_compact + (size_t)i * n_features,
+                   h_X + (size_t)s * n_features,
+                   n_features * sizeof(float));
+            h_y_compact[i] = h_y[s];
+            h_seq[i]       = i;
+        }
+
+        CUDA_CHECK(cudaMalloc(&d_X_batch, (size_t)n_active * n_features * sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&d_y_batch, n_active * sizeof(int)));
+        CUDA_CHECK(cudaMalloc(&d_idx_seq, n_active * sizeof(int)));
+        CUDA_CHECK(cudaMemcpy(d_X_batch, h_X_compact,
+                              (size_t)n_active * n_features * sizeof(float),
+                              cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(d_y_batch, h_y_compact, n_active * sizeof(int), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(d_idx_seq, h_seq, n_active * sizeof(int), cudaMemcpyHostToDevice));
+
+        delete[] h_X_compact;
+        delete[] h_y_compact;
+        delete[] h_seq;
+
+        d_X_use = d_X_batch;
+        d_y_use = d_y_batch;
+    }
+
+    // --- Upload indices (normal mode: original global indices; batch mode: sequential) ---
     int* d_indices = nullptr;
     CUDA_CHECK(cudaMalloc(&d_indices, n_active * sizeof(int)));
-    CUDA_CHECK(cudaMemcpy(d_indices, h_indices, n_active * sizeof(int), cudaMemcpyHostToDevice));
+    if (d_X == nullptr) {
+        // d_idx_seq already uploaded above — copy pointer
+        cudaFree(d_indices);
+        d_indices = d_idx_seq;
+        d_idx_seq = nullptr;
+    } else {
+        CUDA_CHECK(cudaMemcpy(d_indices, h_indices, n_active * sizeof(int), cudaMemcpyHostToDevice));
+    }
 
     // --- Compute bin edges on CPU, upload ---
     // We need the flattened host X for this; reconstruct from GPU is expensive,
@@ -365,11 +461,12 @@ extern "C" void findBestSplitGPU(
     CUDA_CHECK(cudaMemset(d_hist, 0, hist_bytes));
 
     // --- Launch Phase 1: buildHistogramsKernel ---
+    CUDA_CHECK(cudaEventRecord(ev_kern_start));
     {
         dim3 grid(n_features, 1, 1);
         dim3 block(min(n_active, BLOCK_SIZE), 1, 1);
         buildHistogramsKernel<<<grid, block>>>(
-            d_X, d_y, d_indices,
+            d_X_use, d_y_use, d_indices,
             n_active, 0 /*n_samples unused*/, n_features,
             n_bins, n_classes,
             d_bin_edges, d_hist);
@@ -399,6 +496,8 @@ extern "C" void findBestSplitGPU(
         CUDA_CHECK(cudaGetLastError());
         CUDA_CHECK(cudaDeviceSynchronize());
     }
+    CUDA_CHECK(cudaEventRecord(ev_kern_end));
+    CUDA_CHECK(cudaEventSynchronize(ev_kern_end));
 
     // --- Copy results back (only n_features scalars) ---
     float* h_gains      = new float[n_features];
@@ -428,6 +527,24 @@ extern "C" void findBestSplitGPU(
     cudaFree(d_best_gains);
     cudaFree(d_best_bins_arr);
     cudaFree(d_best_thresholds);
+
+    // Batch mode cleanup
+    if (d_X_batch)  cudaFree(d_X_batch);
+    if (d_y_batch)  cudaFree(d_y_batch);
+    if (d_idx_seq)  cudaFree(d_idx_seq);
+
+    // Accumulate timing stats
+    CUDA_CHECK(cudaEventRecord(ev_call_end));
+    CUDA_CHECK(cudaEventSynchronize(ev_call_end));
+    float kern_ms = 0.0f, call_ms = 0.0f;
+    CUDA_CHECK(cudaEventElapsedTime(&kern_ms, ev_kern_start, ev_kern_end));
+    CUDA_CHECK(cudaEventElapsedTime(&call_ms, ev_call_start, ev_call_end));
+    g_total_kernel_ms += kern_ms;
+    g_total_call_ms   += call_ms;
+    g_n_gpu_calls++;
+
+    cudaEventDestroy(ev_call_start); cudaEventDestroy(ev_call_end);
+    cudaEventDestroy(ev_kern_start); cudaEventDestroy(ev_kern_end);
 }
 
 #endif // USE_CUDA
