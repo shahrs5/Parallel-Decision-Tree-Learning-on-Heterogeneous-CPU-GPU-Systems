@@ -2,3 +2,4 @@ build/
 *.exe
 decision-tree/data/synthetic_1m.csv
 decision-tree/data/synthetic_200k.csv
+.venv/
