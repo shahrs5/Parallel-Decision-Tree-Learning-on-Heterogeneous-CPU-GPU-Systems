@@ -22,7 +22,9 @@ class DecisionTree
 {
 public:
     explicit DecisionTree(int max_depth = 10,
-                          int min_samples_leaf = 1);
+                          int min_samples_leaf = 1,
+                          int feature_subsample = -1,
+                          unsigned seed = 42);
 
     ~DecisionTree();
 
@@ -50,7 +52,9 @@ private:
 
     int  max_depth_;
     int  min_samples_leaf_;
-    bool use_gpu_ = true;   // runtime toggle: CPU exact vs GPU histogram
+    int  feature_subsample_;   // -1 = use all features (M2 behavior); >0 = pick this many per split
+    unsigned tree_seed_;       // seeds the per-split feature subsample RNG
+    bool use_gpu_ = true;      // runtime toggle: CPU exact vs GPU histogram
     std::vector<Node> nodes_;
 
     // Flattened row-major feature matrix kept for GPU upload (Person 3).
@@ -66,9 +70,12 @@ private:
 
     int  createEmptyNode();
 
+    // feature_subset: indices of features to evaluate (sorted ascending).
+    // Pass an empty vector to evaluate every feature (M2 behavior).
     bool findBestSplitForNode(const std::vector<std::vector<float>> &X,
                               const std::vector<int> &sample_indices,
                               const std::vector<int> &y,
+                              const std::vector<int> &feature_subset,
                               int   &best_feat,
                               float &best_thresh) const;
 

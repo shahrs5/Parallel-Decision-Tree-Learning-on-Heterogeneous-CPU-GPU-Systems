@@ -15,6 +15,7 @@
 #include "data_loader.h"
 #include "metrics.h"
 #include "tree/decision_tree.h"
+#include "tree/random_forest.h"
 
 #ifdef USE_OPENMP
 #include <omp.h>
@@ -241,6 +242,116 @@ int main()
     std::cout << "  Step 1 (Gini):  " << (s1?"PASS":"FAIL") << "\n";
     std::cout << "  Step 2 (CSV):   " << (s2?"PASS":"FAIL") << "\n";
     std::cout << "  Step 3 (Tree):  " << (s3?"PASS":"FAIL") << "\n";
+
+    // -----------------------------------------------------------------------
+    // Milestone 3 — RandomForest smoke test.
+    // Trains three configurations on Breast Cancer to verify both M3 features
+    // (steps 1+3): bootstrap sampling and per-split feature subsampling.
+    //   1. Single tree            — baseline.
+    //   2. Forest, all features   — bagging only (no subsampling).
+    //   3. Forest, sqrt(F) feats  — full Random Forest.
+    // Full benchmarks come later (teammate B's ticket).
+    // -----------------------------------------------------------------------
+    printSection("Milestone 3 -- RandomForest Smoke Test (serial)");
+    {
+        const std::string path = "../data/breast_cancer.csv";
+        if (!fileExists(path)) {
+            std::cout << "  [SKIP] " << path << " not found\n";
+        } else {
+            std::vector<std::vector<float>> X; std::vector<int> y;
+            loadCSV(path, X, y);
+
+            std::vector<std::vector<float>> X_tr, X_te;
+            std::vector<int> y_tr, y_te;
+            trainTestSplit(X, y, 0.2f, X_tr, y_tr, X_te, y_te);
+
+            const int n_trees = 10, max_depth = 7, min_leaf = 2;
+
+            // --- Single tree baseline ---
+            DecisionTree single(max_depth, min_leaf);
+            auto t0 = std::chrono::high_resolution_clock::now();
+            single.train(X_tr, y_tr);
+            double single_ms = std::chrono::duration<double, std::milli>(
+                std::chrono::high_resolution_clock::now() - t0).count();
+            std::vector<int> p_single;
+            for (auto &s : X_te) p_single.push_back(single.predict(s));
+            float acc_single = accuracy(y_te, p_single);
+
+            // --- Forest, all features (bagging only) ---
+            RandomForest bag(n_trees, max_depth, min_leaf,
+                             /*feature_subsample=*/0, /*seed=*/42);
+            t0 = std::chrono::high_resolution_clock::now();
+            bag.train(X_tr, y_tr);
+            double bag_ms = std::chrono::duration<double, std::milli>(
+                std::chrono::high_resolution_clock::now() - t0).count();
+            float acc_bag = accuracy(y_te, bag.predictBatch(X_te));
+
+            // --- Forest, sqrt(F) features, SERIAL training (1 OMP thread) ---
+#ifdef USE_OPENMP
+            omp_set_num_threads(1);
+#endif
+            RandomForest rf_seq(n_trees, max_depth, min_leaf,
+                                /*feature_subsample=*/-1, /*seed=*/42);
+            t0 = std::chrono::high_resolution_clock::now();
+            rf_seq.train(X_tr, y_tr);
+            double rf_seq_ms = std::chrono::duration<double, std::milli>(
+                std::chrono::high_resolution_clock::now() - t0).count();
+            float acc_rf_seq = accuracy(y_te, rf_seq.predictBatch(X_te));
+
+            // --- Forest, sqrt(F) features, PARALLEL training (all threads) ---
+#ifdef USE_OPENMP
+            omp_set_num_threads(omp_get_max_threads());
+#endif
+            RandomForest rf_par(n_trees, max_depth, min_leaf,
+                                /*feature_subsample=*/-1, /*seed=*/42);
+            t0 = std::chrono::high_resolution_clock::now();
+            rf_par.train(X_tr, y_tr);
+            double rf_par_ms = std::chrono::duration<double, std::milli>(
+                std::chrono::high_resolution_clock::now() - t0).count();
+            float acc_rf_par = accuracy(y_te, rf_par.predictBatch(X_te));
+
+            // --- Inference throughput: serial vs parallel batch ---
+            // Replicate test set to make timing meaningful for small datasets.
+            std::vector<std::vector<float>> X_big;
+            X_big.reserve(X_te.size() * 200);
+            for (int rep = 0; rep < 200; ++rep)
+                for (auto &s : X_te) X_big.push_back(s);
+
+#ifdef USE_OPENMP
+            omp_set_num_threads(1);
+#endif
+            t0 = std::chrono::high_resolution_clock::now();
+            auto p_seq = rf_par.predictBatch(X_big);
+            double infer_seq_ms = std::chrono::duration<double, std::milli>(
+                std::chrono::high_resolution_clock::now() - t0).count();
+
+#ifdef USE_OPENMP
+            omp_set_num_threads(omp_get_max_threads());
+#endif
+            t0 = std::chrono::high_resolution_clock::now();
+            auto p_par = rf_par.predictBatch(X_big);
+            double infer_par_ms = std::chrono::duration<double, std::milli>(
+                std::chrono::high_resolution_clock::now() - t0).count();
+
+            std::cout << std::fixed << std::setprecision(4);
+            std::cout << "  Single tree              : " << single_ms  << " ms,  acc=" << acc_single << "\n";
+            std::cout << "  Forest (bagging,    10)  : " << bag_ms     << " ms,  acc=" << acc_bag    << "\n";
+            std::cout << "  Forest (sqrt(F),seq,10)  : " << rf_seq_ms  << " ms,  acc=" << acc_rf_seq << "\n";
+            std::cout << "  Forest (sqrt(F),par,10)  : " << rf_par_ms  << " ms,  acc=" << acc_rf_par
+                      << "  speedup=" << (rf_seq_ms / rf_par_ms) << "x\n";
+            std::cout << "  Batch inference (" << X_big.size() << " samples):\n";
+            std::cout << "    serial   : " << infer_seq_ms << " ms\n";
+            std::cout << "    parallel : " << infer_par_ms << " ms"
+                      << "  speedup=" << (infer_seq_ms / infer_par_ms) << "x\n";
+            std::cout << "  Predictions match (par vs seq): "
+                      << (p_seq == p_par ? "YES" : "NO") << "\n";
+
+            check("RF parallel accuracy >= 0.85 on Breast Cancer", acc_rf_par >= 0.85f);
+            check("Bagging accuracy >= 0.85",                       acc_bag    >= 0.85f);
+            check("Parallel and serial RF train -> same accuracy",  std::fabs(acc_rf_par - acc_rf_seq) < 1e-5f);
+            check("Parallel batch inference matches serial",        p_seq == p_par);
+        }
+    }
 
 #ifdef USE_CUDA
     // ---- Batch mode test ----

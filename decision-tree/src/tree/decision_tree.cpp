@@ -5,6 +5,7 @@
 #include <limits>
 #include <map>
 #include <numeric>
+#include <random>
 #include <stdexcept>
 #include <vector>
 
@@ -36,8 +37,14 @@ static float giniFromCounts(const std::map<int, int> &counts, int total)
 // ---------------------------------------------------------------------------
 // Constructor / Destructor
 // ---------------------------------------------------------------------------
-DecisionTree::DecisionTree(int max_depth, int min_samples_leaf)
-    : max_depth_(max_depth), min_samples_leaf_(min_samples_leaf)
+DecisionTree::DecisionTree(int max_depth,
+                           int min_samples_leaf,
+                           int feature_subsample,
+                           unsigned seed)
+    : max_depth_(max_depth),
+      min_samples_leaf_(min_samples_leaf),
+      feature_subsample_(feature_subsample),
+      tree_seed_(seed)
 {
     if (max_depth_        < 0) throw std::runtime_error("max_depth must be >= 0");
     if (min_samples_leaf_ < 1) throw std::runtime_error("min_samples_leaf must be >= 1");
@@ -108,8 +115,13 @@ void DecisionTree::train(const std::vector<std::vector<float>> &X,
 
 #ifdef USE_CUDA
     // Free any previous allocation, then upload once.
-    if (d_X_) { freeGPUData(d_X_, d_y_); }
-    uploadDataToGPU(X_flat_.data(), y.data(), n_samples_, n_features_, &d_X_, &d_y_);
+    // M3: skip the upload entirely if the CPU path is forced (use_gpu_=false).
+    // RandomForest forces this for tree-level parallel training, so each tree
+    // avoids paying cudaMalloc+cudaMemcpy for data it will never touch.
+    if (d_X_) { freeGPUData(d_X_, d_y_); d_X_ = nullptr; d_y_ = nullptr; }
+    if (use_gpu_) {
+        uploadDataToGPU(X_flat_.data(), y.data(), n_samples_, n_features_, &d_X_, &d_y_);
+    }
 #endif
 
     nodes_.clear();
@@ -134,6 +146,15 @@ void DecisionTree::trainLevelWise(const std::vector<std::vector<float>> &X,
     std::vector<PendingNode> current_level;
     current_level.push_back({root_idx, all_indices, 0});
 
+    // Per-tree RNG used to draw per-split feature subsets.
+    // Drawn serially in the level loop below — keeps results deterministic and
+    // avoids races with the OpenMP parallel-for over nodes.
+    std::mt19937 tree_rng(tree_seed_);
+
+    // Effective subsample size: <=0 or >= n_features means "use all features".
+    int eff_sub = (feature_subsample_ > 0 && feature_subsample_ < n_features_)
+                  ? feature_subsample_ : 0;
+
     while (!current_level.empty()) {
         int n_nodes = static_cast<int>(current_level.size());
 
@@ -142,6 +163,25 @@ void DecisionTree::trainLevelWise(const std::vector<std::vector<float>> &X,
         std::vector<float> best_thresholds(n_nodes, 0.0f);
         std::vector<bool>  split_found(n_nodes, false);
         std::vector<bool>  make_leaf(n_nodes, false);
+
+        // Per-node feature subsets. Empty vector => use all features.
+        // Generated here in serial so the RNG sequence is deterministic
+        // regardless of OpenMP scheduling in Phase 1 below.
+        std::vector<std::vector<int>> feature_subsets(n_nodes);
+        if (eff_sub > 0) {
+            std::vector<int> pool(n_features_);
+            std::iota(pool.begin(), pool.end(), 0);
+            for (int ni = 0; ni < n_nodes; ++ni) {
+                // Partial Fisher-Yates: shuffle just the first eff_sub slots.
+                for (int i = 0; i < eff_sub; ++i) {
+                    std::uniform_int_distribution<int> d(i, n_features_ - 1);
+                    int j = d(tree_rng);
+                    std::swap(pool[i], pool[j]);
+                }
+                feature_subsets[ni].assign(pool.begin(), pool.begin() + eff_sub);
+                std::sort(feature_subsets[ni].begin(), feature_subsets[ni].end());
+            }
+        }
 
         // ----------------------------------------------------------------
         // Phase 1: compute splits.
@@ -154,7 +194,11 @@ void DecisionTree::trainLevelWise(const std::vector<std::vector<float>> &X,
         // shallow levels (few nodes, many features) and deep levels (many nodes).
         // ----------------------------------------------------------------
 #ifdef USE_OPENMP
-        #pragma omp parallel for schedule(dynamic) if(n_nodes >= omp_get_max_threads())
+        // M3: also disable when already inside an OpenMP region (e.g. when
+        // RandomForest is training trees in parallel) — nested OMP would
+        // either no-op or oversubscribe cores.
+        #pragma omp parallel for schedule(dynamic) \
+            if(n_nodes >= omp_get_max_threads() && !omp_in_parallel())
 #endif
         for (int ni = 0; ni < n_nodes; ++ni) {
             const auto &work   = current_level[ni];
@@ -187,6 +231,7 @@ void DecisionTree::trainLevelWise(const std::vector<std::vector<float>> &X,
             float bt = 0.0f;
             bool  found = false;
 
+            const std::vector<int>& fsub = feature_subsets[ni];
 #ifdef USE_CUDA
             if (use_gpu_) {
                 // GPU histogram path (Person 2 kernels, Person 3 integration).
@@ -203,15 +248,17 @@ void DecisionTree::trainLevelWise(const std::vector<std::vector<float>> &X,
                     n_classes,
                     gini,
                     min_samples_leaf_,
+                    fsub.empty() ? nullptr : fsub.data(),
+                    static_cast<int>(fsub.size()),
                     bf, bt);
                 found = (bf >= 0);
             } else {
                 // CPU exact path (forced via setUseGPU(false) for comparison).
-                found = findBestSplitForNode(X, sidx, y, bf, bt);
+                found = findBestSplitForNode(X, sidx, y, fsub, bf, bt);
             }
 #else
             // CPU path (no CUDA build).
-            found = findBestSplitForNode(X, sidx, y, bf, bt);
+            found = findBestSplitForNode(X, sidx, y, fsub, bf, bt);
 #endif
             best_feats[ni]      = bf;
             best_thresholds[ni] = bt;
@@ -274,6 +321,7 @@ bool DecisionTree::findBestSplitForNode(
     const std::vector<std::vector<float>> &X,
     const std::vector<int> &sample_indices,
     const std::vector<int> &y,
+    const std::vector<int> &feature_subset,
     int   &best_feat,
     float &best_thresh) const
 {
@@ -286,7 +334,20 @@ bool DecisionTree::findBestSplitForNode(
     for (int idx : sample_indices) labels.push_back(y[idx]);
     float parent_gini = computeGini(labels);
 
+    // Decide which features to evaluate.
+    //   - feature_subset empty   -> evaluate every feature (M2 single-tree path).
+    //   - feature_subset present -> Random Forest mode; only those features.
+    std::vector<int> all_features;
+    const std::vector<int>* feats_to_use = &feature_subset;
+    if (feature_subset.empty()) {
+        all_features.resize(n_features);
+        std::iota(all_features.begin(), all_features.end(), 0);
+        feats_to_use = &all_features;
+    }
+    int n_evaluate = static_cast<int>(feats_to_use->size());
+
     // One result slot per feature — threads write to separate indices, no races.
+    // Slots not in the subset stay at -inf and are ignored by the reduction.
     std::vector<float> f_gain(n_features, -std::numeric_limits<float>::infinity());
     std::vector<float> f_thresh(n_features, 0.0f);
 
@@ -299,7 +360,8 @@ bool DecisionTree::findBestSplitForNode(
 #ifdef USE_OPENMP
     #pragma omp parallel for schedule(static) if(!omp_in_parallel() && n_active >= 256)
 #endif
-    for (int f = 0; f < n_features; ++f) {
+    for (int fi = 0; fi < n_evaluate; ++fi) {
+        int f = (*feats_to_use)[fi];
         std::vector<std::pair<float, int>> fvals;
         fvals.reserve(sample_indices.size());
         for (int idx : sample_indices)
@@ -376,7 +438,8 @@ int DecisionTree::buildNode(const std::vector<std::vector<float>> &X,
     }
 
     int bf = -1; float bt = 0.0f;
-    if (!findBestSplitForNode(X, sample_indices, y, bf, bt)) {
+    std::vector<int> empty_subset;   // legacy path: evaluate all features
+    if (!findBestSplitForNode(X, sample_indices, y, empty_subset, bf, bt)) {
         nodes_[node_idx].is_leaf = true;
         return node_idx;
     }

@@ -325,6 +325,8 @@ extern "C" void findBestSplitGPU(
     int          n_classes,
     float        parent_gini,
     int          min_samples_leaf,
+    const int*   feature_subset,
+    int          n_subset,
     int&         out_feature,
     float&       out_threshold)
 {
@@ -508,12 +510,27 @@ extern "C" void findBestSplitGPU(
     CUDA_CHECK(cudaMemcpy(h_thresholds, d_best_thresholds, n_features * sizeof(float), cudaMemcpyDeviceToHost));
 
     // --- CPU-side reduction: pick best feature ---
+    // M3: when feature_subset is provided, restrict the argmax to those
+    // features only. The kernel ran over all features regardless (wasted
+    // compute — TODO: launch only n_subset blocks indexed via feature_subset).
     float best_gain = -1e30f;
-    for (int f = 0; f < n_features; ++f) {
-        if (h_gains[f] > best_gain && h_bins[f] >= 0) {
-            best_gain     = h_gains[f];
-            out_feature   = f;
-            out_threshold = h_thresholds[f];
+    if (feature_subset != nullptr && n_subset > 0) {
+        for (int i = 0; i < n_subset; ++i) {
+            int f = feature_subset[i];
+            if (f < 0 || f >= n_features) continue;
+            if (h_gains[f] > best_gain && h_bins[f] >= 0) {
+                best_gain     = h_gains[f];
+                out_feature   = f;
+                out_threshold = h_thresholds[f];
+            }
+        }
+    } else {
+        for (int f = 0; f < n_features; ++f) {
+            if (h_gains[f] > best_gain && h_bins[f] >= 0) {
+                best_gain     = h_gains[f];
+                out_feature   = f;
+                out_threshold = h_thresholds[f];
+            }
         }
     }
 

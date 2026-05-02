@@ -79,6 +79,7 @@ endif()
 set(SOURCES
     src/main.cpp
     src/tree/decision_tree.cpp
+    src/tree/random_forest.cpp
 )
 
 if(ENABLE_CUDA)

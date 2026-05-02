@@ -39,6 +39,12 @@ void getGPUCallStats(GPUCallStats* out);
 
 // Find the best (feature, threshold) split for a node's sample subset.
 // d_X / d_y remain on GPU; only indices need to be sent each call.
+//
+// feature_subset / n_subset (Milestone 3): when n_subset > 0 the host-side
+// argmax over per-feature gains only considers the listed features. The
+// kernel still computes histograms for ALL features (TODO: optimise by
+// restricting kernel work to subset features).
+//   feature_subset = nullptr OR n_subset == 0  ->  consider all features.
 void findBestSplitGPU(
     const float* d_X,         // GPU feature matrix (null if batch mode)
     const int*   d_y,         // GPU labels (always valid)
@@ -51,6 +57,8 @@ void findBestSplitGPU(
     int          n_classes,
     float        parent_gini,
     int          min_samples_leaf,
+    const int*   feature_subset,  // M3: feature index list (sorted) or nullptr
+    int          n_subset,        // M3: subset size (0 = all features)
     int&         out_feature,
     float&       out_threshold);
 
