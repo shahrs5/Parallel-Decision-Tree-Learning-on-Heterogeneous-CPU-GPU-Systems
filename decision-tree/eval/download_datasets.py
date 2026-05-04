@@ -24,7 +24,7 @@ def write_csv(path, rows):
 def download_all():
     try:
         from sklearn.datasets import (
-            load_iris, load_wine, load_breast_cancer
+            load_iris, load_wine, load_breast_cancer,  fetch_covtype
         )
         import urllib.request
         import numpy as np
@@ -38,7 +38,7 @@ def download_all():
     data = load_iris()
     rows = [list(x) + [int(y)] for x, y in zip(data.data, data.target)]
     write_csv("data/iris.csv", rows)
-
+    
     # ---- Wine ----
     data = load_wine()
     rows = [list(x) + [int(y)] for x, y in zip(data.data, data.target)]
@@ -48,6 +48,13 @@ def download_all():
     data = load_breast_cancer()
     rows = [list(x) + [int(y)] for x, y in zip(data.data, data.target)]
     write_csv("data/breast_cancer.csv", rows)
+
+    # ---- CoverType ----
+    print("  Downloading Covertype dataset (this may take a moment)...")
+    data = fetch_covtype()
+    rows = [list(map(float, x)) + [int(y)] 
+        for x, y in zip(data.data, data.target)]
+    write_csv("data/covertype.csv", rows)
 
     # ---- Banknote Authentication (UCI) ----
     url = "https://archive.ics.uci.edu/ml/machine-learning-databases/00267/data_banknote_authentication.txt"
