@@ -322,14 +322,18 @@ int main()
         {"Iris",          "../data/iris.csv",          5, 1},
         {"Wine",          "../data/wine.csv",          5, 1},
         {"Breast Cancer", "../data/breast_cancer.csv", 7, 2},
-        {"Banknote Auth", "../data/banknote.csv",      5, 1},
-        {"Synthetic",     "../data/synthetic.csv",     8, 1}
+        {"Banknote Auth", "../data/banknote.csv", 5, 1},
+        {"Covertype", "data/covertype.csv", 10, 5}
     };
 
-    std::vector<BenchmarkResult> results;
-    for (const auto &d : datasets) {
-        if (!fileExists(d.path)) { std::cout << "[SKIP] " << d.path << "\n"; continue; }
-        results.push_back(runBenchmark(d.name, d.path, d.depth, d.leaf));
+    for (const auto &d : datasets)
+    {
+        if (!fileExists(d.path))
+        {
+            std::cout << "[SKIP] Missing dataset file: " << d.path << "\n";
+            continue;
+        }
+        results.push_back(runDatasetBenchmark(d.name, d.path, d.max_depth, d.min_leaf));
     }
 
     // ---- Summary table ----
