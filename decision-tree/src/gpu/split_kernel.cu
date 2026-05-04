@@ -316,12 +316,8 @@ extern "C" void freeGPUData(float* d_X, int* d_y)
 extern "C" void findBestSplitGPU(
     const float* d_X,
     const int*   d_y,
-<<<<<<< HEAD
-    const float* h_X,   
-=======
     const float* h_X,
     const int*   h_y,
->>>>>>> ibrahim
     const int*   h_indices,
     int          n_active,
     int          n_features,

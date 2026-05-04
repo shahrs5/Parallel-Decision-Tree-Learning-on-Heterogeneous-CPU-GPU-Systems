@@ -145,7 +145,7 @@ struct BenchmarkResult {
     double speedup;
 };
 
-static BenchmarkResult runBenchmark(
+static BenchmarkResult runDatasetBenchmark(
     const std::string &name, const std::string &path,
     int max_depth = 5, int min_leaf = 1, float test_ratio = 0.2f)
 {
@@ -371,8 +371,9 @@ int main()
 
     // ---- Dataset benchmarks ----
     printSection("Milestone 2 -- Single Tree: Sequential vs Parallel (UCI Datasets)");
+    std::vector<BenchmarkResult> results;
 
-    struct DatasetConfig { std::string name, path; int depth, leaf; };
+    struct DatasetConfig { std::string name, path; int max_depth, min_leaf; };
     std::vector<DatasetConfig> datasets = {
         {"Iris",          "../data/iris.csv",          5, 1},
         {"Wine",          "../data/wine.csv",          5, 1},

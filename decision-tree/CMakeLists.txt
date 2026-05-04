@@ -49,7 +49,7 @@ if(ENABLE_CUDA)
     message(STATUS "CUDA enabled — architecture: ${CMAKE_CUDA_ARCHITECTURES}")
 
     set(CUDA_KERNEL_SRC "${CMAKE_SOURCE_DIR}/src/gpu/split_kernel.cu")
-    set(CUDA_KERNEL_OBJ "${CMAKE_BINARY_DIR}/split_kernel_cuda.obj")
+    set(CUDA_KERNEL_OBJ "${CMAKE_BINARY_DIR}/split_kernel_cuda.o")
 
     # Explicit nvcc invocation — no CMake-injected MSVC flags.
     add_custom_command(
@@ -62,7 +62,7 @@ if(ENABLE_CUDA)
                 -DUSE_CUDA -DUSE_OPENMP
                 -std=c++17
                 -O2
-                -Xcompiler=/MD
+                -Xcompiler -fPIC
                 --generate-code arch=compute_${CMAKE_CUDA_ARCHITECTURES},code=[compute_${CMAKE_CUDA_ARCHITECTURES},sm_${CMAKE_CUDA_ARCHITECTURES}]
         DEPENDS "${CUDA_KERNEL_SRC}"
                 "${CMAKE_SOURCE_DIR}/src/gpu/split_kernel.cuh"
