@@ -20,6 +20,10 @@
 #include <omp.h>
 #endif
 
+#ifdef USE_CUDA
+#include "gpu/split_kernel.cuh"
+#endif
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -238,6 +242,57 @@ int main()
     std::cout << "  Step 2 (CSV):   " << (s2?"PASS":"FAIL") << "\n";
     std::cout << "  Step 3 (Tree):  " << (s3?"PASS":"FAIL") << "\n";
 
+#ifdef USE_CUDA
+    // ---- Batch mode test ----
+    // Trains on Breast Cancer in normal GPU mode, then forces batch mode
+    // (simulates dataset too large for VRAM) and trains again.
+    // Predictions must be identical — same histogram kernel, different data path.
+    printSection("GPU Batch Processing Test");
+    {
+        const std::string bpath = "../data/breast_cancer.csv";
+        bool batch_pass = false;
+        if (!fileExists(bpath)) {
+            std::cout << "  [SKIP] " << bpath << " not found\n";
+        } else {
+            std::vector<std::vector<float>> X;
+            std::vector<int> y;
+            loadCSV(bpath, X, y);
+            int n = static_cast<int>(X.size());
+
+            // Normal mode (full upload)
+            DecisionTree t_normal(7, 2);
+            t_normal.train(X, y);
+            std::vector<int> preds_normal(n);
+            for (int i = 0; i < n; ++i) preds_normal[i] = t_normal.predict(X[i]);
+
+            // Batch mode (force d_X = nullptr path)
+            setForceBatchMode(true);
+            DecisionTree t_batch(7, 2);
+            t_batch.train(X, y);
+            std::vector<int> preds_batch(n);
+            for (int i = 0; i < n; ++i) preds_batch[i] = t_batch.predict(X[i]);
+            setForceBatchMode(false);
+
+            int mismatches = 0;
+            for (int i = 0; i < n; ++i)
+                if (preds_normal[i] != preds_batch[i]) ++mismatches;
+
+            float acc_normal = 0, acc_batch = 0;
+            for (int i = 0; i < n; ++i) {
+                if (preds_normal[i] == y[i]) acc_normal++;
+                if (preds_batch[i]  == y[i]) acc_batch++;
+            }
+            acc_normal /= n; acc_batch /= n;
+
+            batch_pass = (mismatches == 0);
+            std::cout << "  Normal mode accuracy : " << std::fixed << std::setprecision(4) << acc_normal << "\n";
+            std::cout << "  Batch mode accuracy  : " << acc_batch << "\n";
+            std::cout << "  Prediction mismatches: " << mismatches << "\n";
+            check("Batch mode produces identical predictions to normal mode", batch_pass);
+        }
+    }
+#endif
+
     // ---- Split-Finding Kernel Benchmark ----
     // This benchmarks findBestSplitForNode in isolation — the exact operation
     // the GPU histogram kernel replaces.  Measures speedup vs node size,
@@ -322,8 +377,9 @@ int main()
         {"Iris",          "../data/iris.csv",          5, 1},
         {"Wine",          "../data/wine.csv",          5, 1},
         {"Breast Cancer", "../data/breast_cancer.csv", 7, 2},
-        {"Banknote Auth", "../data/banknote.csv", 5, 1},
-        {"Covertype", "data/covertype.csv", 10, 5}
+        {"Banknote Auth", "../data/banknote.csv",      5, 1},
+        {"Synthetic",     "../data/synthetic.csv",     8, 1},
+         {"Covertype",    "data/covertype.csv",       10, 5}
     };
 
     for (const auto &d : datasets)
@@ -361,6 +417,116 @@ int main()
                   << std::setw(10) << r.accuracy
                   << "\n";
     }
+
+#ifdef USE_CUDA
+    // ---- Scalability benchmark ----
+    // Generates synthetic data at increasing sizes in C++ (no CSV needed).
+    // Measures sequential and parallel training time vs n_samples.
+    printSection("GPU Scalability -- Training Time vs Dataset Size");
+    {
+        std::vector<int> sizes = {500, 1000, 2000, 5000, 10000, 25000};
+        const int n_feat = 20, depth = 7, leaf = 2, reps = 3;
+
+        std::cout << std::left
+                  << std::setw(10) << "Samples"
+                  << std::setw(14) << "Seq(ms)"
+                  << std::setw(14) << "Par(ms)"
+                  << std::setw(10) << "Speedup"
+                  << std::setw(14) << "KernelUtil%"
+                  << std::setw(10) << "Nodes"
+                  << "\n" << std::string(72, '-') << "\n";
+
+        for (int n : sizes) {
+            // Generate synthetic 2-class data
+            std::mt19937 rng(42);
+            std::normal_distribution<float> nd(0.0f, 1.0f);
+            std::vector<std::vector<float>> X(n, std::vector<float>(n_feat));
+            std::vector<int> y(n);
+            for (int i = 0; i < n; ++i) {
+                float sum = 0;
+                for (int f = 0; f < n_feat; ++f) { X[i][f] = nd(rng); sum += X[i][f]; }
+                y[i] = (sum > 0) ? 1 : 0;
+            }
+
+            // Sequential
+            double seq_ms = 0;
+            int n_nodes = 0;
+            for (int r = 0; r < reps; ++r) {
+                resetGPUCallStats();
+                DecisionTree t(depth, leaf);
+                auto t0 = std::chrono::high_resolution_clock::now();
+                t.train(X, y);
+                auto t1 = std::chrono::high_resolution_clock::now();
+                seq_ms += std::chrono::duration<double, std::milli>(t1 - t0).count();
+                n_nodes = static_cast<int>(t.nodes().size());
+            }
+            seq_ms /= reps;
+
+            // Parallel — collect GPU stats on last rep
+            double par_ms = 0;
+            GPUCallStats stats{};
+            for (int r = 0; r < reps; ++r) {
+                resetGPUCallStats();
+                DecisionTree t(depth, leaf);
+                auto t0 = std::chrono::high_resolution_clock::now();
+                t.train(X, y);
+                auto t1 = std::chrono::high_resolution_clock::now();
+                par_ms += std::chrono::duration<double, std::milli>(t1 - t0).count();
+                getGPUCallStats(&stats);
+            }
+            par_ms /= reps;
+
+            float util = (stats.total_ms > 0)
+                         ? (stats.kernel_ms / stats.total_ms) * 100.0f : 0.0f;
+
+            std::cout << std::fixed << std::setprecision(2) << std::left
+                      << std::setw(10) << n
+                      << std::setw(14) << seq_ms
+                      << std::setw(14) << par_ms
+                      << std::setw(10) << seq_ms / par_ms
+                      << std::setw(14) << util
+                      << std::setw(10) << n_nodes
+                      << "\n";
+        }
+    }
+
+    // ---- GPU utilization detail (on synthetic 10k) ----
+    printSection("GPU Utilization Breakdown (n=10000, f=20)");
+    {
+        const int n = 10000, n_feat = 20, depth = 7, leaf = 2;
+        std::mt19937 rng(42);
+        std::normal_distribution<float> nd(0.0f, 1.0f);
+        std::vector<std::vector<float>> X(n, std::vector<float>(n_feat));
+        std::vector<int> y(n);
+        for (int i = 0; i < n; ++i) {
+            float sum = 0;
+            for (int f = 0; f < n_feat; ++f) { X[i][f] = nd(rng); sum += X[i][f]; }
+            y[i] = (sum > 0) ? 1 : 0;
+        }
+
+        resetGPUCallStats();
+        DecisionTree t(depth, leaf);
+        auto t0 = std::chrono::high_resolution_clock::now();
+        t.train(X, y);
+        auto t1 = std::chrono::high_resolution_clock::now();
+        double wall_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+
+        GPUCallStats s{};
+        getGPUCallStats(&s);
+        float overhead_ms = s.total_ms - s.kernel_ms;
+        float util = (s.total_ms > 0) ? (s.kernel_ms / s.total_ms) * 100.0f : 0.0f;
+
+        std::cout << std::fixed << std::setprecision(3);
+        std::cout << "  Total training wall time : " << wall_ms        << " ms\n";
+        std::cout << "  Total GPU call time      : " << s.total_ms     << " ms  (across " << s.n_calls << " nodes)\n";
+        std::cout << "  Kernel compute time      : " << s.kernel_ms    << " ms\n";
+        std::cout << "  Transfer + sync overhead : " << overhead_ms    << " ms\n";
+        std::cout << "  GPU compute utilization  : " << util           << " %\n";
+        std::cout << "  CPU overhead (non-GPU)   : " << wall_ms - s.total_ms << " ms\n";
+        std::cout << "  Avg kernel time / node   : " << s.kernel_ms / s.n_calls << " ms\n";
+        std::cout << "  Avg overhead / node      : " << overhead_ms   / s.n_calls << " ms\n";
+    }
+#endif
 
     return (s1 && s2 && s3) ? 0 : 1;
 }

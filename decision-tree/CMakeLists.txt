@@ -1,9 +1,13 @@
 cmake_minimum_required(VERSION 3.18)
 
+# CMP0141: suppress MSVC debug-info abstraction so -Fd/-FS are not injected.
+if(POLICY CMP0141)
+    cmake_policy(SET CMP0141 NEW)
+    set(CMAKE_MSVC_DEBUG_INFORMATION_FORMAT "")
+endif()
+
 # ---------------------------------------------------------------------------
 # Project declaration
-# Milestone 1: CXX only.
-# Milestone 2 (Person 3): OpenMP enabled by default; CUDA opt-in via -DENABLE_CUDA=ON.
 # ---------------------------------------------------------------------------
 project(DecisionTree LANGUAGES CXX)
 
@@ -16,8 +20,7 @@ if(MINGW)
 endif()
 
 # ---------------------------------------------------------------------------
-# OpenMP (Milestone 2 — Person 3: level-wise parallel node expansion)
-# Enabled by default; disable with -DENABLE_OPENMP=OFF
+# OpenMP
 # ---------------------------------------------------------------------------
 option(ENABLE_OPENMP "Enable OpenMP parallelism for level-wise tree building" ON)
 
@@ -29,20 +32,43 @@ else()
 endif()
 
 # ---------------------------------------------------------------------------
-# CUDA (Milestone 2 — Person 2/3: GPU-accelerated split finding)
+# CUDA
 # Opt-in: cmake -DENABLE_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=89 ..
-#   75 = RTX 20xx (Turing)
-#   86 = RTX 30xx (Ampere)
-#   89 = RTX 40xx (Ada Lovelace) — RTX 4060
+#   89 = RTX 40xx (Ada Lovelace)  86 = RTX 30xx  75 = RTX 20xx
 # ---------------------------------------------------------------------------
-option(ENABLE_CUDA "Enable CUDA GPU acceleration (Milestone 2+)" OFF)
+option(ENABLE_CUDA "Enable CUDA GPU acceleration" OFF)
 
 if(ENABLE_CUDA)
-    enable_language(CUDA)
-    set(CMAKE_CUDA_STANDARD 17)
+    # CMake 4.x + MSVC + Ninja injects -Fd/-FS into nvcc via comma-separated
+    # -Xcompiler which nvcc misparses as multiple input files.  Work around by
+    # compiling split_kernel.cu with an explicit add_custom_command that calls
+    # nvcc directly with only the flags we control.
+    find_package(CUDAToolkit REQUIRED)
     set(CMAKE_CUDA_ARCHITECTURES 89 CACHE STRING "CUDA target GPU architecture")
     add_compile_definitions(USE_CUDA)
     message(STATUS "CUDA enabled — architecture: ${CMAKE_CUDA_ARCHITECTURES}")
+
+    set(CUDA_KERNEL_SRC "${CMAKE_SOURCE_DIR}/src/gpu/split_kernel.cu")
+    set(CUDA_KERNEL_OBJ "${CMAKE_BINARY_DIR}/split_kernel_cuda.obj")
+
+    # Explicit nvcc invocation — no CMake-injected MSVC flags.
+    add_custom_command(
+        OUTPUT  "${CUDA_KERNEL_OBJ}"
+        COMMAND "${CUDAToolkit_NVCC_EXECUTABLE}"
+                -x cu -c "${CUDA_KERNEL_SRC}"
+                -o "${CUDA_KERNEL_OBJ}"
+                -I "${CMAKE_SOURCE_DIR}/src"
+                -I "${CMAKE_SOURCE_DIR}/eval"
+                -DUSE_CUDA -DUSE_OPENMP
+                -std=c++17
+                -O2
+                -Xcompiler=/MD
+                --generate-code arch=compute_${CMAKE_CUDA_ARCHITECTURES},code=[compute_${CMAKE_CUDA_ARCHITECTURES},sm_${CMAKE_CUDA_ARCHITECTURES}]
+        DEPENDS "${CUDA_KERNEL_SRC}"
+                "${CMAKE_SOURCE_DIR}/src/gpu/split_kernel.cuh"
+        COMMENT "Compiling CUDA kernel: split_kernel.cu"
+        VERBATIM
+    )
 else()
     message(STATUS "CUDA disabled — CPU-only build")
 endif()
@@ -56,7 +82,7 @@ set(SOURCES
 )
 
 if(ENABLE_CUDA)
-    list(APPEND SOURCES src/gpu/split_kernel.cu)
+    list(APPEND SOURCES "${CUDA_KERNEL_OBJ}")
 endif()
 
 add_executable(decision_tree ${SOURCES})
@@ -78,10 +104,18 @@ if(ENABLE_OPENMP)
 endif()
 
 # ---------------------------------------------------------------------------
-# Compiler warnings
+# Link CUDA runtime
+# ---------------------------------------------------------------------------
+if(ENABLE_CUDA)
+    target_link_libraries(decision_tree PRIVATE CUDA::cudart)
+endif()
+
+# ---------------------------------------------------------------------------
+# Compiler warnings (CXX only — CUDA file compiled via custom command above)
 # ---------------------------------------------------------------------------
 if(MSVC)
-    target_compile_options(decision_tree PRIVATE /W4)
+    target_compile_options(decision_tree PRIVATE
+        $<$<COMPILE_LANGUAGE:CXX>:/W4>)
 else()
     target_compile_options(decision_tree PRIVATE -Wall -Wextra -Wpedantic)
 endif()
