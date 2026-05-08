@@ -509,7 +509,8 @@ int runAllTests()
         {"Breast Cancer", "../data/breast_cancer.csv", 7, 2},
         {"Banknote Auth", "../data/banknote.csv",      5, 1},
         {"Synthetic",     "../data/synthetic.csv",     8, 1},
-         {"Covertype",    "data/covertype.csv",       10, 5}
+         {"Covertype",    "data/covertype.csv",       10, 5},
+         {"Synthetic(1M)",  "../data/synthetic_1m.csv",    8, 5}
     };
 
     for (const auto &d : datasets)
@@ -675,6 +676,7 @@ int runAllTests()
         {"Banknote Auth",  "../data/banknote.csv",        5,  1},
         {"Synthetic (6k)", "../data/synthetic.csv",       8,  1},
         {"Synthetic 200k", "../data/synthetic_200k.csv",  8,  5},
+         {"Synthetic(1M)",  "../data/synthetic_1m.csv",    8, 5}
     };
 
     std::cout << std::left

@@ -56,6 +56,20 @@ static const int MAX_CLASSES = 64;   // max number of distinct class labels
 static const int BLOCK_SIZE  = 256;  // threads per block for histogram kernel
 
 static bool  g_force_batch_mode = false;
+// ---------------------------------------------------------------------------
+// Persistent reusable GPU buffers
+
+static int*   g_d_indices         = nullptr;
+static int*   g_d_hist            = nullptr;
+static float* g_d_best_gains      = nullptr;
+static int*   g_d_best_bins       = nullptr;
+static float* g_d_best_thresholds = nullptr;
+static float* g_d_bin_edges       = nullptr;
+
+// current capacities
+static int g_cap_indices  = 0;
+static int g_cap_hist     = 0;
+static int g_cap_features = 0;
 static float g_total_kernel_ms  = 0.0f;
 static float g_total_call_ms    = 0.0f;
 static int   g_n_gpu_calls      = 0;
@@ -72,6 +86,79 @@ extern "C" void getGPUCallStats(GPUCallStats* out) {
     out->kernel_ms = g_total_kernel_ms;
     out->total_ms  = g_total_call_ms;
     out->n_calls   = g_n_gpu_calls;
+}
+
+// ---------------------------------------------------------------------------
+// Ensure persistent buffers have enough capacity
+// ---------------------------------------------------------------------------
+
+static void ensurePersistentBuffers(
+    int n_active,
+    int n_features,
+    int n_bins,
+    int n_classes)
+{
+    // indices
+    if (n_active > g_cap_indices) {
+
+        if (g_d_indices)
+            cudaFree(g_d_indices);
+
+        CUDA_CHECK(cudaMalloc(
+            &g_d_indices,
+            n_active * sizeof(int)));
+
+        g_cap_indices = n_active;
+    }
+
+    // histogram
+    int hist_elems = n_features * n_bins * n_classes;
+
+    if (hist_elems > g_cap_hist) {
+
+        if (g_d_hist)
+            cudaFree(g_d_hist);
+
+        CUDA_CHECK(cudaMalloc(
+            &g_d_hist,
+            hist_elems * sizeof(int)));
+
+        g_cap_hist = hist_elems;
+    }
+
+    // feature-sized arrays
+    if (n_features > g_cap_features) {
+
+        if (g_d_best_gains)
+            cudaFree(g_d_best_gains);
+
+        if (g_d_best_bins)
+            cudaFree(g_d_best_bins);
+
+        if (g_d_best_thresholds)
+            cudaFree(g_d_best_thresholds);
+
+        if (g_d_bin_edges)
+            cudaFree(g_d_bin_edges);
+
+        CUDA_CHECK(cudaMalloc(
+            &g_d_best_gains,
+            n_features * sizeof(float)));
+
+        CUDA_CHECK(cudaMalloc(
+            &g_d_best_bins,
+            n_features * sizeof(int)));
+
+        CUDA_CHECK(cudaMalloc(
+            &g_d_best_thresholds,
+            n_features * sizeof(float)));
+
+        CUDA_CHECK(cudaMalloc(
+            &g_d_bin_edges,
+            n_features * n_bins * sizeof(float)));
+
+        g_cap_features = n_features;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -311,6 +398,25 @@ extern "C" void freeGPUData(float* d_X, int* d_y)
 {
     if (d_X) cudaFree(d_X);
     if (d_y) cudaFree(d_y);
+    // cleanup persistent reusable buffers
+
+    if (g_d_indices)         cudaFree(g_d_indices);
+    if (g_d_hist)            cudaFree(g_d_hist);
+    if (g_d_best_gains)      cudaFree(g_d_best_gains);
+    if (g_d_best_bins)       cudaFree(g_d_best_bins);
+    if (g_d_best_thresholds) cudaFree(g_d_best_thresholds);
+    if (g_d_bin_edges)       cudaFree(g_d_bin_edges);
+
+    g_d_indices         = nullptr;
+    g_d_hist            = nullptr;
+    g_d_best_gains      = nullptr;
+    g_d_best_bins       = nullptr;
+    g_d_best_thresholds = nullptr; 
+    g_d_bin_edges       = nullptr;
+
+    g_cap_indices  = 0;
+    g_cap_hist     = 0;
+    g_cap_features = 0;
 }
 
 extern "C" void findBestSplitGPU(
@@ -332,6 +438,12 @@ extern "C" void findBestSplitGPU(
 {
     out_feature   = -1;
     out_threshold = 0.0f;
+
+    ensurePersistentBuffers(
+    n_active,
+    n_features,
+    n_bins,
+    n_classes);
 
     if (n_active < 2 || n_classes > MAX_CLASSES) return;
 
@@ -387,8 +499,7 @@ extern "C" void findBestSplitGPU(
     }
 
     // --- Upload indices (normal mode: original global indices; batch mode: sequential) ---
-    int* d_indices = nullptr;
-    CUDA_CHECK(cudaMalloc(&d_indices, n_active * sizeof(int)));
+    int* d_indices = g_d_indices;
     if (d_X == nullptr) {
         // d_idx_seq already uploaded above — copy pointer
         cudaFree(d_indices);
@@ -451,15 +562,13 @@ extern "C" void findBestSplitGPU(
     }
     delete[] h_X_active;
 
-    float* d_bin_edges = nullptr;
-    CUDA_CHECK(cudaMalloc(&d_bin_edges, n_features * n_bins * sizeof(float)));
+    float* d_bin_edges = g_d_bin_edges;
     CUDA_CHECK(cudaMemcpy(d_bin_edges, h_bin_edges, n_features * n_bins * sizeof(float), cudaMemcpyHostToDevice));
     delete[] h_bin_edges;
 
     // --- Allocate histogram ---
-    int* d_hist = nullptr;
+    int* d_hist = g_d_hist;
     size_t hist_bytes = (size_t)n_features * n_bins * n_classes * sizeof(int);
-    CUDA_CHECK(cudaMalloc(&d_hist, hist_bytes));
     CUDA_CHECK(cudaMemset(d_hist, 0, hist_bytes));
 
     // --- Launch Phase 1: buildHistogramsKernel ---
@@ -477,13 +586,10 @@ extern "C" void findBestSplitGPU(
     }
 
     // --- Allocate output arrays ---
-    float* d_best_gains      = nullptr;
-    int*   d_best_bins_arr   = nullptr;
-    float* d_best_thresholds = nullptr;
-    CUDA_CHECK(cudaMalloc(&d_best_gains,      n_features * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&d_best_bins_arr,   n_features * sizeof(int)));
-    CUDA_CHECK(cudaMalloc(&d_best_thresholds, n_features * sizeof(float)));
-
+    float* d_best_gains      = g_d_best_gains;
+    int*   d_best_bins_arr   = g_d_best_bins;
+    float* d_best_thresholds = g_d_best_thresholds;
+   
     // --- Launch Phase 2: findBestSplitKernel ---
     {
         int bins_block = min(n_bins, 1024);
@@ -537,13 +643,6 @@ extern "C" void findBestSplitGPU(
     delete[] h_gains;
     delete[] h_bins;
     delete[] h_thresholds;
-
-    cudaFree(d_indices);
-    cudaFree(d_bin_edges);
-    cudaFree(d_hist);
-    cudaFree(d_best_gains);
-    cudaFree(d_best_bins_arr);
-    cudaFree(d_best_thresholds);
 
     // Batch mode cleanup
     if (d_X_batch)  cudaFree(d_X_batch);
