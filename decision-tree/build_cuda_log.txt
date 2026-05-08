@@ -1,0 +1,8 @@
+The system cannot find the path specified.
+--- CMake Configure --- 
+'cmake' is not recognized as an internal or external command,
+operable program or batch file.
+--- CMake Build --- 
+'cmake' is not recognized as an internal or external command,
+operable program or batch file.
+--- Done --- 

@@ -17,11 +17,13 @@ RandomForest::RandomForest(int n_trees,
                            int max_depth,
                            int min_samples_leaf,
                            int feature_subsample,
+                           bool use_gpu,
                            unsigned seed)
     : n_trees_(n_trees),
       max_depth_(max_depth),
       min_samples_leaf_(min_samples_leaf),
       feature_subsample_(feature_subsample),
+      use_gpu_(use_gpu),
       seed_(seed)
 {
     if (n_trees_ < 1)
@@ -94,25 +96,28 @@ void RandomForest::train(const std::vector<std::vector<float>> &X,
     for (int t = 0; t < n_trees_; ++t) {
         auto tree = std::make_unique<DecisionTree>(
             max_depth_, min_samples_leaf_, eff_sub, tree_seeds[t]);
-        // Force CPU split path: under tree-level OpenMP, kernel launches from
-        // multiple threads would serialize on the GPU and the timing globals
-        // in split_kernel.cu would race. The single-tree GPU benchmark in
-        // main.cpp does not go through RandomForest, so this is fine.
-        tree->setUseGPU(false);
+        tree->setUseGPU(use_gpu_);
         trees_.push_back(std::move(tree));
     }
 
-    // Tree-level OpenMP: trees are independent, so the loop is embarrassingly
-    // parallel. The DecisionTree internals self-disable via !omp_in_parallel()
-    // once we are inside this region, which keeps thread counts sane.
+    // Train trees: parallel if CPU, sequential if GPU (to avoid kernel serialization)
+    if (use_gpu_) {
+        for (int t = 0; t < n_trees_; ++t) {
+            std::vector<std::vector<float>> X_boot;
+            std::vector<int>                y_boot;
+            bootstrapSample(X, y, tree_seeds[t], X_boot, y_boot);
+            trees_[t]->train(X_boot, y_boot);
+        }
+    } else {
 #ifdef USE_OPENMP
-    #pragma omp parallel for schedule(dynamic) if(n_trees_ > 1)
+        #pragma omp parallel for schedule(dynamic) if(n_trees_ > 1)
 #endif
-    for (int t = 0; t < n_trees_; ++t) {
-        std::vector<std::vector<float>> X_boot;
-        std::vector<int>                y_boot;
-        bootstrapSample(X, y, tree_seeds[t], X_boot, y_boot);
-        trees_[t]->train(X_boot, y_boot);
+        for (int t = 0; t < n_trees_; ++t) {
+            std::vector<std::vector<float>> X_boot;
+            std::vector<int>                y_boot;
+            bootstrapSample(X, y, tree_seeds[t], X_boot, y_boot);
+            trees_[t]->train(X_boot, y_boot);
+        }
     }
 }
 

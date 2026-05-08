@@ -216,9 +216,9 @@ static BenchmarkResult runDatasetBenchmark(
 }
 
 // ---------------------------------------------------------------------------
-// main
+// Test runner
 // ---------------------------------------------------------------------------
-int main()
+int runAllTests()
 {
     std::cout << "Decision Tree -- Milestone 2: Parallel Level-Wise + GPU-Ready Pipeline\n";
 
@@ -291,7 +291,7 @@ int main()
             omp_set_num_threads(1);
 #endif
             RandomForest rf_seq(n_trees, max_depth, min_leaf,
-                                /*feature_subsample=*/-1, /*seed=*/42);
+                                /*feature_subsample=*/-1, /*use_gpu=*/false, /*seed=*/42);
             t0 = std::chrono::high_resolution_clock::now();
             rf_seq.train(X_tr, y_tr);
             double rf_seq_ms = std::chrono::duration<double, std::milli>(
@@ -303,12 +303,23 @@ int main()
             omp_set_num_threads(omp_get_max_threads());
 #endif
             RandomForest rf_par(n_trees, max_depth, min_leaf,
-                                /*feature_subsample=*/-1, /*seed=*/42);
+                                /*feature_subsample=*/-1, /*use_gpu=*/false, /*seed=*/42);
             t0 = std::chrono::high_resolution_clock::now();
             rf_par.train(X_tr, y_tr);
             double rf_par_ms = std::chrono::duration<double, std::milli>(
                 std::chrono::high_resolution_clock::now() - t0).count();
             float acc_rf_par = accuracy(y_te, rf_par.predictBatch(X_te));
+
+#ifdef USE_CUDA
+            // --- Forest, sqrt(F) features, GPU training (sequential) ---
+            RandomForest rf_gpu(n_trees, max_depth, min_leaf,
+                                /*feature_subsample=*/-1, /*use_gpu=*/true, /*seed=*/42);
+            t0 = std::chrono::high_resolution_clock::now();
+            rf_gpu.train(X_tr, y_tr);
+            double rf_gpu_ms = std::chrono::duration<double, std::milli>(
+                std::chrono::high_resolution_clock::now() - t0).count();
+            float acc_rf_gpu = accuracy(y_te, rf_gpu.predictBatch(X_te));
+#endif
 
             // --- Inference throughput: serial vs parallel batch ---
             // Replicate test set to make timing meaningful for small datasets.
@@ -339,6 +350,10 @@ int main()
             std::cout << "  Forest (sqrt(F),seq,10)  : " << rf_seq_ms  << " ms,  acc=" << acc_rf_seq << "\n";
             std::cout << "  Forest (sqrt(F),par,10)  : " << rf_par_ms  << " ms,  acc=" << acc_rf_par
                       << "  speedup=" << (rf_seq_ms / rf_par_ms) << "x\n";
+#ifdef USE_CUDA
+            std::cout << "  Forest (sqrt(F),gpu,10)  : " << rf_gpu_ms  << " ms,  acc=" << acc_rf_gpu
+                      << "  speedup=" << (rf_seq_ms / rf_gpu_ms) << "x\n";
+#endif
             std::cout << "  Batch inference (" << X_big.size() << " samples):\n";
             std::cout << "    serial   : " << infer_seq_ms << " ms\n";
             std::cout << "    parallel : " << infer_par_ms << " ms"
@@ -348,6 +363,9 @@ int main()
 
             check("RF parallel accuracy >= 0.85 on Breast Cancer", acc_rf_par >= 0.85f);
             check("Bagging accuracy >= 0.85",                       acc_bag    >= 0.85f);
+#ifdef USE_CUDA
+            check("RF GPU accuracy >= 0.85",                       acc_rf_gpu >= 0.85f);
+#endif
             check("Parallel and serial RF train -> same accuracy",  std::fabs(acc_rf_par - acc_rf_seq) < 1e-5f);
             check("Parallel batch inference matches serial",        p_seq == p_par);
         }
@@ -738,4 +756,115 @@ int main()
 #endif // USE_CUDA
 
     return (s1 && s2 && s3) ? 0 : 1;
+}
+
+int main(int argc, char* argv[]) {
+    if (argc > 1) {
+        std::string cmd = argv[1];
+        if (cmd == "--benchmark-rf-cpu" && argc >= 6) {
+            // --benchmark-rf-cpu dataset n_trees max_depth min_leaf
+            std::string dataset = argv[2];
+            int n_trees = std::stoi(argv[3]);
+            int max_depth = std::stoi(argv[4]);
+            int min_leaf = std::stoi(argv[5]);
+            std::string path = "../data/" + dataset + ".csv";
+            std::vector<std::vector<float>> X, X_tr, X_te;
+            std::vector<int> y, y_tr, y_te;
+            loadCSV(path, X, y);
+            trainTestSplit(X, y, 0.2f, X_tr, y_tr, X_te, y_te, 42);
+            RandomForest rf(n_trees, max_depth, min_leaf, -1, false, 42);
+            auto t0 = std::chrono::high_resolution_clock::now();
+            rf.train(X_tr, y_tr);
+            double time_ms = std::chrono::duration<double, std::milli>(
+                std::chrono::high_resolution_clock::now() - t0).count();
+            float acc = accuracy(y_te, rf.predictBatch(X_te));
+            std::cout << time_ms << " " << acc << std::endl;
+            return 0;
+        } else if (cmd == "--benchmark-rf-gpu" && argc >= 6) {
+            // --benchmark-rf-gpu dataset n_trees max_depth min_leaf
+#ifdef USE_CUDA
+            std::string dataset = argv[2];
+            int n_trees = std::stoi(argv[3]);
+            int max_depth = std::stoi(argv[4]);
+            int min_leaf = std::stoi(argv[5]);
+            std::string path = "../data/" + dataset + ".csv";
+            std::vector<std::vector<float>> X, X_tr, X_te;
+            std::vector<int> y, y_tr, y_te;
+            loadCSV(path, X, y);
+            trainTestSplit(X, y, 0.2f, X_tr, y_tr, X_te, y_te, 42);
+            RandomForest rf(n_trees, max_depth, min_leaf, -1, true, 42);
+            auto t0 = std::chrono::high_resolution_clock::now();
+            rf.train(X_tr, y_tr);
+            double time_ms = std::chrono::duration<double, std::milli>(
+                std::chrono::high_resolution_clock::now() - t0).count();
+            float acc = accuracy(y_te, rf.predictBatch(X_te));
+            std::cout << time_ms << " " << acc << std::endl;
+#else
+            std::cout << "-1 -1" << std::endl;
+#endif
+            return 0;
+        } else if (cmd == "--benchmark-infer-seq" && argc >= 4) {
+            // --benchmark-infer-seq dataset n_samples
+            std::string dataset = argv[2];
+            int n_samples = std::stoi(argv[3]);
+            std::string path = "../data/" + dataset + ".csv";
+            std::vector<std::vector<float>> X, X_tr, X_te;
+            std::vector<int> y, y_tr, y_te;
+            loadCSV(path, X, y);
+            trainTestSplit(X, y, 0.2f, X_tr, y_tr, X_te, y_te, 42);
+            RandomForest rf(10, 7, 2, -1, false, 42);
+            rf.train(X_tr, y_tr);
+            // Replicate test set
+            std::vector<std::vector<float>> X_big;
+            X_big.reserve(X_te.size() * (n_samples / X_te.size() + 1));
+            while (X_big.size() < (size_t)n_samples) {
+                for (auto &s : X_te) {
+                    if (X_big.size() >= (size_t)n_samples) break;
+                    X_big.push_back(s);
+                }
+            }
+            X_big.resize(n_samples);
+#ifdef USE_OPENMP
+            omp_set_num_threads(1);
+#endif
+            auto t0 = std::chrono::high_resolution_clock::now();
+            rf.predictBatch(X_big);
+            double time_ms = std::chrono::duration<double, std::milli>(
+                std::chrono::high_resolution_clock::now() - t0).count();
+            std::cout << time_ms << std::endl;
+            return 0;
+        } else if (cmd == "--benchmark-infer-par" && argc >= 4) {
+            // --benchmark-infer-par dataset n_samples
+            std::string dataset = argv[2];
+            int n_samples = std::stoi(argv[3]);
+            std::string path = "../data/" + dataset + ".csv";
+            std::vector<std::vector<float>> X, X_tr, X_te;
+            std::vector<int> y, y_tr, y_te;
+            loadCSV(path, X, y);
+            trainTestSplit(X, y, 0.2f, X_tr, y_tr, X_te, y_te, 42);
+            RandomForest rf(10, 7, 2, -1, false, 42);
+            rf.train(X_tr, y_tr);
+            // Replicate test set
+            std::vector<std::vector<float>> X_big;
+            X_big.reserve(X_te.size() * (n_samples / X_te.size() + 1));
+            while (X_big.size() < (size_t)n_samples) {
+                for (auto &s : X_te) {
+                    if (X_big.size() >= (size_t)n_samples) break;
+                    X_big.push_back(s);
+                }
+            }
+            X_big.resize(n_samples);
+#ifdef USE_OPENMP
+            omp_set_num_threads(omp_get_max_threads());
+#endif
+            auto t0 = std::chrono::high_resolution_clock::now();
+            rf.predictBatch(X_big);
+            double time_ms = std::chrono::duration<double, std::milli>(
+                std::chrono::high_resolution_clock::now() - t0).count();
+            std::cout << time_ms << std::endl;
+            return 0;
+        }
+    }
+
+    return runAllTests();
 }

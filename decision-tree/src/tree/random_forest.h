@@ -32,6 +32,7 @@ public:
                  int max_depth,
                  int min_samples_leaf,
                  int feature_subsample = -1,
+                 bool use_gpu = false,
                  unsigned seed = 42);
 
     void train(const std::vector<std::vector<float>> &X,
@@ -49,6 +50,7 @@ private:
     int      max_depth_;
     int      min_samples_leaf_;
     int      feature_subsample_;   // -1 = sqrt(F), 0 = all, >0 = explicit
+    bool     use_gpu_;
     unsigned seed_;
 
     std::vector<std::unique_ptr<DecisionTree>> trees_;
