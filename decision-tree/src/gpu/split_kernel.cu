@@ -60,6 +60,8 @@ static float g_total_kernel_ms  = 0.0f;
 static float g_total_call_ms    = 0.0f;
 static int   g_n_gpu_calls      = 0;
 
+extern "C" void warmupCUDA() { cudaFree(0); }
+
 extern "C" void setForceBatchMode(bool force) { g_force_batch_mode = force; }
 
 extern "C" void resetGPUCallStats() {

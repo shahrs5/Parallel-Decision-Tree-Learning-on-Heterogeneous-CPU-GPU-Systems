@@ -1,7 +1,10 @@
 build/
+build_msvc/
 *.exe
 decision-tree/data/synthetic_1m.csv
 decision-tree/data/synthetic_200k.csv
 .venv/
+__pycache__/
+*.pyc
 
 *.csv

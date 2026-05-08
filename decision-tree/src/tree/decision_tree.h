@@ -35,6 +35,11 @@ public:
 
     const std::vector<Node> &nodes() const { return nodes_; }
 
+    // Returns a compact FlatNode representation of the trained tree suitable
+    // for GPU upload and fast inference.  Drops debug fields (gini,
+    // sample_count); uses feature_index < 0 as the leaf sentinel.
+    std::vector<FlatNode> getPackedNodes() const;
+
     // Runtime GPU toggle (only meaningful when compiled with USE_CUDA).
     // Set to false to force the CPU exact-split path within a GPU build,
     // enabling direct CPU-vs-GPU timing comparison in the same binary.

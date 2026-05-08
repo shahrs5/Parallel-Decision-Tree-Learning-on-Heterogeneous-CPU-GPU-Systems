@@ -80,6 +80,25 @@ int DecisionTree::majorityLabel(const std::vector<int> &labels)
 }
 
 // ---------------------------------------------------------------------------
+// getPackedNodes — compact flat copy of nodes_ for GPU inference.
+// ---------------------------------------------------------------------------
+std::vector<FlatNode> DecisionTree::getPackedNodes() const
+{
+    std::vector<FlatNode> packed;
+    packed.reserve(nodes_.size());
+    for (const auto &n : nodes_) {
+        FlatNode fn;
+        fn.threshold     = n.threshold;
+        fn.feature_index = n.is_leaf ? -1 : n.feature_index;
+        fn.left_child    = n.left_child;
+        fn.right_child   = n.right_child;
+        fn.label         = n.label;
+        packed.push_back(fn);
+    }
+    return packed;
+}
+
+// ---------------------------------------------------------------------------
 // createEmptyNode
 // ---------------------------------------------------------------------------
 int DecisionTree::createEmptyNode()

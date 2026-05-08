@@ -10,6 +10,10 @@
 #include <omp.h>
 #endif
 
+#ifdef USE_CUDA
+#include "../gpu/infer_kernel.cuh"
+#endif
+
 // ---------------------------------------------------------------------------
 // Constructor
 // ---------------------------------------------------------------------------
@@ -138,6 +142,51 @@ int RandomForest::predict(const std::vector<float> &sample) const
         [](const auto &a, const auto &b) { return a.second < b.second; })
         ->first;
 }
+
+// ---------------------------------------------------------------------------
+// predictBatchGPU — GPU batch inference (Milestone 3, optional).
+//
+// Packs all trees into a single contiguous FlatNode array, uploads it plus
+// the sample matrix once, then runs forestInferKernel (one thread per sample).
+// The kernel performs majority voting in registers and writes predictions
+// directly.  Falls back cleanly to predictBatch() in CPU-only builds.
+// ---------------------------------------------------------------------------
+#ifdef USE_CUDA
+std::vector<int> RandomForest::predictBatchGPU(
+    const std::vector<std::vector<float>> &X) const
+{
+    if (trees_.empty())
+        throw std::runtime_error("RandomForest::predictBatchGPU: forest not trained");
+    int n_samples  = static_cast<int>(X.size());
+    int n_features = n_samples > 0 ? static_cast<int>(X[0].size()) : 0;
+    if (n_samples == 0) return {};
+
+    // Build one contiguous FlatNode array: tree 0 nodes, tree 1 nodes, …
+    std::vector<int>      offsets(n_trees_);
+    std::vector<FlatNode> all_nodes;
+    int offset = 0;
+    for (int t = 0; t < n_trees_; ++t) {
+        offsets[t] = offset;
+        auto packed = trees_[t]->getPackedNodes();
+        all_nodes.insert(all_nodes.end(), packed.begin(), packed.end());
+        offset += static_cast<int>(packed.size());
+    }
+
+    // Flatten sample matrix row-major.
+    std::vector<float> X_flat(static_cast<size_t>(n_samples) * n_features);
+    for (int i = 0; i < n_samples; ++i)
+        for (int f = 0; f < n_features; ++f)
+            X_flat[static_cast<size_t>(i) * n_features + f] = X[i][f];
+
+    std::vector<int> preds(n_samples);
+    forestInferGPU(
+        all_nodes.data(), static_cast<int>(all_nodes.size()),
+        offsets.data(),   n_trees_,
+        X_flat.data(),    n_samples, n_features,
+        preds.data());
+    return preds;
+}
+#endif
 
 // ---------------------------------------------------------------------------
 // predictBatch — sample-level parallel inference.

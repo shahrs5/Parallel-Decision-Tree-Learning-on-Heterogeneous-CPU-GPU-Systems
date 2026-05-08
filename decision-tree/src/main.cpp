@@ -422,6 +422,109 @@ int runAllTests()
     }
 #endif
 
+    // ---- M3: Speedup vs Number of Trees ----
+    // Shows how OpenMP tree-level parallelism scales with ensemble size.
+    // Measures: serial (1 thread) vs parallel (all threads) for n_trees in
+    // {1,5,10,20,50} on Breast Cancer; also runs GPU batch inference timing.
+    printSection("Milestone 3 -- Ensemble Speedup vs Number of Trees");
+    {
+        const std::string bc_path = "../data/breast_cancer.csv";
+        if (!fileExists(bc_path)) {
+            std::cout << "  [SKIP] " << bc_path << " not found\n";
+        } else {
+            std::vector<std::vector<float>> X, X_tr, X_te;
+            std::vector<int> y, y_tr, y_te;
+            loadCSV(bc_path, X, y);
+            trainTestSplit(X, y, 0.2f, X_tr, y_tr, X_te, y_te);
+
+            std::cout << std::left
+                      << std::setw(10) << "N_Trees"
+                      << std::setw(14) << "Seq(ms)"
+                      << std::setw(14) << "Par(ms)"
+                      << std::setw(10) << "Speedup"
+                      << std::setw(10) << "Accuracy"
+                      << "\n" << std::string(58, '-') << "\n";
+
+            for (int nt : {1, 5, 10, 20, 50}) {
+#ifdef USE_OPENMP
+                omp_set_num_threads(1);
+#endif
+                RandomForest rf_seq(nt, 7, 2, -1, false, 42);
+                auto t0 = std::chrono::high_resolution_clock::now();
+                rf_seq.train(X_tr, y_tr);
+                double seq_ms = std::chrono::duration<double, std::milli>(
+                    std::chrono::high_resolution_clock::now() - t0).count();
+
+#ifdef USE_OPENMP
+                omp_set_num_threads(omp_get_max_threads());
+#endif
+                RandomForest rf_par(nt, 7, 2, -1, false, 42);
+                t0 = std::chrono::high_resolution_clock::now();
+                rf_par.train(X_tr, y_tr);
+                double par_ms = std::chrono::duration<double, std::milli>(
+                    std::chrono::high_resolution_clock::now() - t0).count();
+
+                float acc = accuracy(y_te, rf_par.predictBatch(X_te));
+                double sp = (par_ms > 0) ? seq_ms / par_ms : 1.0;
+
+                std::cout << std::fixed << std::setprecision(2) << std::left
+                          << std::setw(10) << nt
+                          << std::setw(14) << seq_ms
+                          << std::setw(14) << par_ms
+                          << std::setw(10) << sp
+                          << std::fixed << std::setprecision(4)
+                          << std::setw(10) << acc
+                          << "\n";
+            }
+#ifdef USE_OPENMP
+            omp_set_num_threads(omp_get_max_threads());
+#endif
+
+#ifdef USE_CUDA
+            // GPU batch inference comparison (10-tree forest, varying batch size).
+            std::cout << "\n  GPU vs CPU Inference Throughput (10-tree forest):\n";
+            std::cout << std::left
+                      << std::setw(12) << "  Batch"
+                      << std::setw(14) << "CPU-par(ms)"
+                      << std::setw(14) << "GPU(ms)"
+                      << std::setw(10) << "Speedup"
+                      << "\n  " << std::string(48, '-') << "\n";
+
+            RandomForest rf_infer(10, 7, 2, -1, false, 42);
+            rf_infer.train(X_tr, y_tr);
+
+            for (int batch : {500, 1000, 5000, 10000, 50000}) {
+                std::vector<std::vector<float>> X_big;
+                X_big.reserve(batch);
+                while ((int)X_big.size() < batch)
+                    for (auto &s : X_te) { if ((int)X_big.size() >= batch) break; X_big.push_back(s); }
+                X_big.resize(batch);
+
+#ifdef USE_OPENMP
+                omp_set_num_threads(omp_get_max_threads());
+#endif
+                auto t0 = std::chrono::high_resolution_clock::now();
+                rf_infer.predictBatch(X_big);
+                double cpu_ms = std::chrono::duration<double, std::milli>(
+                    std::chrono::high_resolution_clock::now() - t0).count();
+
+                t0 = std::chrono::high_resolution_clock::now();
+                rf_infer.predictBatchGPU(X_big);
+                double gpu_ms = std::chrono::duration<double, std::milli>(
+                    std::chrono::high_resolution_clock::now() - t0).count();
+
+                double sp = (gpu_ms > 0) ? cpu_ms / gpu_ms : 0.0;
+                std::cout << std::fixed << std::setprecision(2) << std::left
+                          << "  " << std::setw(10) << batch
+                          << std::setw(14) << cpu_ms
+                          << std::setw(14) << gpu_ms
+                          << std::setw(10) << sp
+                          << "\n";
+            }
+#endif // USE_CUDA
+        }
+    }
+
     // ---- Split-Finding Kernel Benchmark ----
     // This benchmarks findBestSplitForNode in isolation — the exact operation
     // the GPU histogram kernel replaces.  Measures speedup vs node size,
@@ -783,6 +886,7 @@ int main(int argc, char* argv[]) {
         } else if (cmd == "--benchmark-rf-gpu" && argc >= 6) {
             // --benchmark-rf-gpu dataset n_trees max_depth min_leaf
 #ifdef USE_CUDA
+            warmupCUDA();  // initialise CUDA context before timing
             std::string dataset = argv[2];
             int n_trees = std::stoi(argv[3]);
             int max_depth = std::stoi(argv[4]);
@@ -862,6 +966,74 @@ int main(int argc, char* argv[]) {
             double time_ms = std::chrono::duration<double, std::milli>(
                 std::chrono::high_resolution_clock::now() - t0).count();
             std::cout << time_ms << std::endl;
+            return 0;
+        } else if (cmd == "--benchmark-infer-gpu" && argc >= 4) {
+            // --benchmark-infer-gpu dataset n_samples
+            // Trains a 10-tree CPU forest, then runs GPU batch inference.
+            // Outputs: time_ms (inference only, CUDA context pre-warmed)
+#ifdef USE_CUDA
+            warmupCUDA();  // initialise CUDA context so it is not included in timing
+            std::string dataset  = argv[2];
+            int         n_samp   = std::stoi(argv[3]);
+            std::string path     = "../data/" + dataset + ".csv";
+            std::vector<std::vector<float>> X, X_tr, X_te;
+            std::vector<int> y, y_tr, y_te;
+            loadCSV(path, X, y);
+            trainTestSplit(X, y, 0.2f, X_tr, y_tr, X_te, y_te, 42);
+            RandomForest rf(10, 7, 2, -1, false, 42);
+            rf.train(X_tr, y_tr);
+            std::vector<std::vector<float>> X_big;
+            X_big.reserve(X_te.size() * (n_samp / (int)X_te.size() + 1));
+            while ((int)X_big.size() < n_samp) {
+                for (auto &s : X_te) {
+                    if ((int)X_big.size() >= n_samp) break;
+                    X_big.push_back(s);
+                }
+            }
+            X_big.resize(n_samp);
+            auto t0 = std::chrono::high_resolution_clock::now();
+            rf.predictBatchGPU(X_big);
+            double time_ms = std::chrono::duration<double, std::milli>(
+                std::chrono::high_resolution_clock::now() - t0).count();
+            std::cout << time_ms << std::endl;
+#else
+            std::cout << "-1" << std::endl;
+#endif
+            return 0;
+        } else if (cmd == "--benchmark-rf-speedup" && argc >= 3) {
+            // --benchmark-rf-speedup dataset
+            // Measures sequential vs parallel training time for n_trees in
+            // {1,5,10,20,50}. Outputs CSV rows: n_trees,seq_ms,par_ms
+            std::string dataset = argv[2];
+            std::string path    = "../data/" + dataset + ".csv";
+            std::vector<std::vector<float>> X, X_tr, X_te;
+            std::vector<int> y, y_tr, y_te;
+            loadCSV(path, X, y);
+            trainTestSplit(X, y, 0.2f, X_tr, y_tr, X_te, y_te, 42);
+            for (int n_trees : {1, 5, 10, 20, 50}) {
+#ifdef USE_OPENMP
+                omp_set_num_threads(1);
+#endif
+                RandomForest rf_seq(n_trees, 7, 2, -1, false, 42);
+                auto t0 = std::chrono::high_resolution_clock::now();
+                rf_seq.train(X_tr, y_tr);
+                double seq_ms = std::chrono::duration<double, std::milli>(
+                    std::chrono::high_resolution_clock::now() - t0).count();
+#ifdef USE_OPENMP
+                omp_set_num_threads(omp_get_max_threads());
+#endif
+                RandomForest rf_par(n_trees, 7, 2, -1, false, 42);
+                t0 = std::chrono::high_resolution_clock::now();
+                rf_par.train(X_tr, y_tr);
+                double par_ms = std::chrono::duration<double, std::milli>(
+                    std::chrono::high_resolution_clock::now() - t0).count();
+                float acc = accuracy(y_te, rf_par.predictBatch(X_te));
+                std::cout << n_trees << " " << seq_ms << " " << par_ms
+                          << " " << acc << "\n";
+            }
+#ifdef USE_OPENMP
+            omp_set_num_threads(omp_get_max_threads());
+#endif
             return 0;
         }
     }

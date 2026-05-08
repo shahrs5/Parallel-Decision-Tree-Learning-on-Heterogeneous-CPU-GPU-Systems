@@ -43,6 +43,14 @@ public:
     std::vector<int> predictBatch(
         const std::vector<std::vector<float>> &X) const;
 
+#ifdef USE_CUDA
+    // GPU batch inference: packs all trees into FlatNode arrays, uploads once,
+    // then runs forestInferKernel (one thread per sample).  Faster than
+    // predictBatch() when n_samples is large (amortises kernel launch cost).
+    std::vector<int> predictBatchGPU(
+        const std::vector<std::vector<float>> &X) const;
+#endif
+
     int n_trees() const { return static_cast<int>(trees_.size()); }
 
 private:

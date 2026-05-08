@@ -13,6 +13,11 @@
 extern "C" {
 #endif
 
+// Initialise the CUDA context so subsequent timed calls are not penalised
+// by the one-time driver load (~100-150 ms on Windows).  Call once before
+// any benchmark timer starts.
+void warmupCUDA();
+
 // Force batch mode regardless of available GPU memory (for testing).
 void setForceBatchMode(bool force);
 

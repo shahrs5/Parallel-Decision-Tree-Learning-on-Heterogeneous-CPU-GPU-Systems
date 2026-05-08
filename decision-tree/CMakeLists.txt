@@ -62,11 +62,33 @@ if(ENABLE_CUDA)
                 -DUSE_CUDA -DUSE_OPENMP
                 -std=c++17
                 -O2
-                -Xcompiler -fPIC
+                -Xcompiler /MD
                 --generate-code arch=compute_${CMAKE_CUDA_ARCHITECTURES},code=[compute_${CMAKE_CUDA_ARCHITECTURES},sm_${CMAKE_CUDA_ARCHITECTURES}]
         DEPENDS "${CUDA_KERNEL_SRC}"
                 "${CMAKE_SOURCE_DIR}/src/gpu/split_kernel.cuh"
         COMMENT "Compiling CUDA kernel: split_kernel.cu"
+        VERBATIM
+    )
+
+    # Milestone 3: GPU batch inference kernel.
+    set(CUDA_INFER_SRC "${CMAKE_SOURCE_DIR}/src/gpu/infer_kernel.cu")
+    set(CUDA_INFER_OBJ "${CMAKE_BINARY_DIR}/infer_kernel_cuda.o")
+
+    add_custom_command(
+        OUTPUT  "${CUDA_INFER_OBJ}"
+        COMMAND "${CUDAToolkit_NVCC_EXECUTABLE}"
+                -x cu -c "${CUDA_INFER_SRC}"
+                -o "${CUDA_INFER_OBJ}"
+                -I "${CMAKE_SOURCE_DIR}/src"
+                -DUSE_CUDA -DUSE_OPENMP
+                -std=c++17
+                -O2
+                -Xcompiler /MD
+                --generate-code arch=compute_${CMAKE_CUDA_ARCHITECTURES},code=[compute_${CMAKE_CUDA_ARCHITECTURES},sm_${CMAKE_CUDA_ARCHITECTURES}]
+        DEPENDS "${CUDA_INFER_SRC}"
+                "${CMAKE_SOURCE_DIR}/src/gpu/infer_kernel.cuh"
+                "${CMAKE_SOURCE_DIR}/src/tree/node.h"
+        COMMENT "Compiling CUDA kernel: infer_kernel.cu"
         VERBATIM
     )
 else()
@@ -84,6 +106,7 @@ set(SOURCES
 
 if(ENABLE_CUDA)
     list(APPEND SOURCES "${CUDA_KERNEL_OBJ}")
+    list(APPEND SOURCES "${CUDA_INFER_OBJ}")
 endif()
 
 add_executable(decision_tree ${SOURCES})

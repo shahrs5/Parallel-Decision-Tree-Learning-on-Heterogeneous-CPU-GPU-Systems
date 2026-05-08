@@ -56,3 +56,22 @@ struct Node {
     // Useful for analysis and minimum-samples stopping criteria.
     int sample_count = 0;
 };
+
+// ---------------------------------------------------------------------------
+// FlatNode — compact node layout for fast inference and GPU transfer.
+//
+// Drops debug fields (gini, sample_count) present in Node, saving ~38% space
+// (20 bytes vs 32 bytes per node).  Used by DecisionTree::getPackedNodes()
+// and the GPU batch inference kernel in src/gpu/infer_kernel.cu.
+//
+// feature_index < 0 identifies a leaf (mirrors is_leaf in Node).
+// All fields are plain 4-byte types so the struct is directly uploadable to
+// GPU memory with no padding or endianness issues.
+// ---------------------------------------------------------------------------
+struct FlatNode {
+    float threshold;      // split threshold (0 if leaf)
+    int   feature_index;  // split feature index, -1 if leaf
+    int   left_child;     // index into tree's FlatNode array, -1 if leaf
+    int   right_child;    // index into tree's FlatNode array, -1 if leaf
+    int   label;          // majority-vote class (valid at leaves)
+};
