@@ -66,6 +66,7 @@ static int*   g_d_best_bins       = nullptr;
 static float* g_d_best_thresholds = nullptr;
 static float* g_d_bin_edges       = nullptr;
 
+
 // current capacities
 static int g_cap_indices  = 0;
 static int g_cap_hist     = 0;
@@ -73,6 +74,7 @@ static int g_cap_features = 0;
 static float g_total_kernel_ms  = 0.0f;
 static float g_total_call_ms    = 0.0f;
 static int   g_n_gpu_calls      = 0;
+static bool g_bin_edges_uploaded = false;
 
 extern "C" void warmupCUDA() { cudaFree(0); }
 
@@ -256,6 +258,11 @@ __global__ void findBestSplitKernel(
     int bin = threadIdx.x;
     if (bin >= n_bins) return;
 
+ 
+    if (n_classes > MAX_CLASSES) {
+        return;
+    }
+
     // Build prefix sums [0..bin] into left_counts.
 
     int left_counts[MAX_CLASSES]  = {0};
@@ -419,6 +426,7 @@ extern "C" void freeGPUData(float* d_X, int* d_y)
     g_cap_indices  = 0;
     g_cap_hist     = 0;
     g_cap_features = 0;
+    g_bin_edges_uploaded = false;
 }
 
 extern "C" void findBestSplitGPU(
@@ -426,6 +434,7 @@ extern "C" void findBestSplitGPU(
     const int*   d_y,
     const float* h_X,
     const int*   h_y,
+    const float* h_global_bin_edges,
     const int*   h_indices,
     int          n_active,
     int          n_features,
@@ -448,6 +457,10 @@ extern "C" void findBestSplitGPU(
     n_classes);
 
     if (n_active < 2 || n_classes > MAX_CLASSES) return;
+
+    if (n_active <= 0 || n_features <= 0 || n_bins <= 0 || n_classes <= 0) {
+    return;
+}
 
     // Timing: wall time for the entire call
     cudaEvent_t ev_call_start, ev_call_end;
@@ -501,14 +514,19 @@ extern "C" void findBestSplitGPU(
     }
 
     // --- Upload indices (normal mode: original global indices; batch mode: sequential) ---
-    int* d_indices = g_d_indices;
+    int* d_indices = nullptr;
+
     if (d_X == nullptr) {
-        // d_idx_seq already uploaded above — copy pointer
-        cudaFree(d_indices);
         d_indices = d_idx_seq;
         d_idx_seq = nullptr;
     } else {
-        CUDA_CHECK(cudaMemcpy(d_indices, h_indices, n_active * sizeof(int), cudaMemcpyHostToDevice));
+        d_indices = g_d_indices;
+
+        CUDA_CHECK(cudaMemcpy(
+            d_indices,
+            h_indices,
+            n_active * sizeof(int),
+            cudaMemcpyHostToDevice));
     }
 
     // --- Compute bin edges on CPU, upload ---
@@ -524,67 +542,47 @@ extern "C" void findBestSplitGPU(
     // For now, use a uniform binning approach as a fallback that avoids download.
     // We download only min/max per feature (2 values × n_features << full data).
 
-    float* h_bin_edges = new float[n_features * n_bins];
+    // REMOVED DUE TO HUGE OVERHEAD  NOW WE PRE CALCULATE BINEDGES
 
-    // Download the active feature values for bin-edge estimation.
-    // Only download n_active × n_features values — much smaller than full X.
-    float* h_X_active = new float[(size_t)n_active * n_features];
-
-    for (int i = 0; i < n_active; ++i) {
-       int sample = h_indices[i];
-       memcpy(
-           h_X_active + (size_t)i * n_features,
-           h_X + (size_t)sample * n_features,
-           n_features * sizeof(float)
-       );
-    }
-
-   // Compute quantile bin edges.
-   for (int f = 0; f < n_features; ++f) {
-        float* vals = new float[n_active];
-        for (int i = 0; i < n_active; ++i)
-           vals[i] = h_X_active[(size_t)i * n_features + f];
-
-        float* edges = h_bin_edges + f * n_bins;
-
-        // copy once so nth_element doesn't corrupt future selections
-        float* temp = new float[n_active];
-        memcpy(temp, vals, n_active * sizeof(float));
-
-        for (int b = 0; b < n_bins; ++b) {
-          int q = (int)(((float)(b + 1) / (float)n_bins) * n_active);
-          if (q >= n_active) q = n_active - 1;
-
-          std::nth_element(temp, temp + q, temp + n_active);
-          edges[b] = temp[q];
-        }
-
-        delete[] temp;
-        delete[] vals;
-    }
-    delete[] h_X_active;
+    
 
     float* d_bin_edges = g_d_bin_edges;
-    CUDA_CHECK(cudaMemcpy(d_bin_edges, h_bin_edges, n_features * n_bins * sizeof(float), cudaMemcpyHostToDevice));
-    delete[] h_bin_edges;
 
+    if (!g_bin_edges_uploaded) {
+
+        CUDA_CHECK(cudaMemcpy(
+            d_bin_edges,
+            h_global_bin_edges,
+            n_features * n_bins * sizeof(float),
+            cudaMemcpyHostToDevice));
+
+        g_bin_edges_uploaded = true;
+    }
     // --- Allocate histogram ---
     int* d_hist = g_d_hist;
     size_t hist_bytes = (size_t)n_features * n_bins * n_classes * sizeof(int);
     CUDA_CHECK(cudaMemset(d_hist, 0, hist_bytes));
 
+    if (n_active <= 0) {
+        out_feature = -1;
+        out_threshold = 0.0f;
+        return;
+    }
     // --- Launch Phase 1: buildHistogramsKernel ---
     CUDA_CHECK(cudaEventRecord(ev_kern_start));
     {
         dim3 grid(n_features, 1, 1);
-        dim3 block(min(n_active, BLOCK_SIZE), 1, 1);
+
+        int threads = max(1, min(n_active, BLOCK_SIZE));
+
+        dim3 block(threads, 1, 1);
+
         buildHistogramsKernel<<<grid, block>>>(
             d_X_use, d_y_use, d_indices,
             n_active, 0 /*n_samples unused*/, n_features,
             n_bins, n_classes,
             d_bin_edges, d_hist);
         CUDA_CHECK(cudaGetLastError());
-        CUDA_CHECK(cudaDeviceSynchronize());
     }
 
     // --- Allocate output arrays ---
@@ -594,17 +592,19 @@ extern "C" void findBestSplitGPU(
    
     // --- Launch Phase 2: findBestSplitKernel ---
     {
-        int bins_block = min(n_bins, 1024);
+        int bins_block = max(1, min(n_bins, 64));
+
         size_t shared_bytes = (size_t)bins_block * 2 * sizeof(float);
+
         dim3 grid(n_features, 1, 1);
         dim3 block(bins_block, 1, 1);
+
         findBestSplitKernel<<<grid, block, shared_bytes>>>(
             d_hist, d_bin_edges,
             n_features, n_bins, n_classes,
             n_active, parent_gini, min_samples_leaf,
             d_best_gains, d_best_bins_arr, d_best_thresholds);
         CUDA_CHECK(cudaGetLastError());
-        CUDA_CHECK(cudaDeviceSynchronize());
     }
     CUDA_CHECK(cudaEventRecord(ev_kern_end));
     CUDA_CHECK(cudaEventSynchronize(ev_kern_end));

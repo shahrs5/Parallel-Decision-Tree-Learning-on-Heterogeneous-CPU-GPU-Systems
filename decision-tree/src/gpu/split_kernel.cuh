@@ -55,6 +55,7 @@ void findBestSplitGPU(
     const int*   d_y,         // GPU labels (always valid)
     const float* h_X,         // host flat feature matrix
     const int*   h_y,         // host labels (used in batch mode when d_X==null)
+    const float* h_global_bin_edges,
     const int*   h_indices,   // CPU array — copied to GPU inside this call
     int          n_active,
     int          n_features,

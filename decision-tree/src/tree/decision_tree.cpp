@@ -131,6 +131,31 @@ void DecisionTree::train(const std::vector<std::vector<float>> &X,
     for (int i = 0; i < n_samples_; ++i)
         for (int f = 0; f < n_features_; ++f)
             X_flat_[(std::size_t)i * n_features_ + f] = X[i][f];
+    
+    const int N_BINS = 32;
+
+    global_bin_edges_.resize(n_features_ * N_BINS);
+
+    for (int f = 0; f < n_features_; ++f) {
+
+        float fmin = X[0][f];
+        float fmax = X[0][f];
+
+        for (int i = 1; i < n_samples_; ++i) {
+            fmin = std::min(fmin, X[i][f]);
+            fmax = std::max(fmax, X[i][f]);
+        }
+
+        if (fabs(fmax - fmin) < 1e-12f)
+          fmax = fmin + 1e-3f;
+
+        float step = (fmax - fmin) / N_BINS;
+
+        for (int b = 0; b < N_BINS; ++b) {
+            global_bin_edges_[f * N_BINS + b] =
+                fmin + step * (b + 1);
+        }
+    }
 
 #ifdef USE_CUDA
     // Free any previous allocation, then upload once.
@@ -261,6 +286,7 @@ void DecisionTree::trainLevelWise(const std::vector<std::vector<float>> &X,
                 findBestSplitGPU(
                     d_X_, d_y_,
                     X_flat_.data(), y.data(),
+                    global_bin_edges_.data(),
                     sidx.data(), static_cast<int>(sidx.size()),
                     n_features_,
                     /*n_bins=*/32,
