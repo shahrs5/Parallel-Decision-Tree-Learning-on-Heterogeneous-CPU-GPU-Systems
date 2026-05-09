@@ -56,6 +56,7 @@ private:
     unsigned tree_seed_;       // seeds the per-split feature subsample RNG
     bool use_gpu_ = true;      // runtime toggle: CPU exact vs GPU histogram
     std::vector<Node> nodes_;
+    std::vector<float> global_bin_edges_;
 
     // Flattened row-major feature matrix kept for GPU upload (Person 3).
     // Populated in train(); reused across nodes so we upload once.

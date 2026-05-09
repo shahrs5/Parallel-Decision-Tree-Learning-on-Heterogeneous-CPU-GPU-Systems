@@ -504,13 +504,38 @@ int runAllTests()
 
     struct DatasetConfig { std::string name, path; int max_depth, min_leaf; };
     std::vector<DatasetConfig> datasets = {
-        {"Iris",          "../data/iris.csv",          5, 1},
-        {"Wine",          "../data/wine.csv",          5, 1},
-        {"Breast Cancer", "../data/breast_cancer.csv", 7, 2},
-        {"Banknote Auth", "../data/banknote.csv",      5, 1},
-        {"Synthetic",     "../data/synthetic.csv",     8, 1},
-         {"Covertype",    "data/covertype.csv",       10, 5},
-         {"Synthetic(1M)",  "../data/synthetic_1m.csv",    8, 5}
+    // =======================================================
+    // REAL DATASETS
+    // =========================================================
+    {"Breast Cancer",        "../data/breast_cancer.csv",            30, 2},
+    {"Banknote Auth",        "../data/banknote.csv",                  4, 2},
+    {"CoverType",            "../data/covertype.csv",                54, 7},
+
+    // =========================================================
+    // SYNTHETIC DATASETS — 8 FEATURES
+    // =========================================================
+    {"Synthetic(100K-8F)",   "../data/synthetic_100000_8f.csv",       8, 2},
+    {"Synthetic(200K-8F)",   "../data/synthetic_200000_8f.csv",       8, 2},
+    {"Synthetic(300K-8F)",   "../data/synthetic_300000_8f.csv",       8, 2},
+    {"Synthetic(500K-8F)",   "../data/synthetic_500000_8f.csv",       8, 2},
+    {"Synthetic(1M-8F)",     "../data/synthetic_1000000_8f.csv",      8, 2},
+
+    // =========================================================
+    // SYNTHETIC DATASETS — 16 FEATURES
+    // =========================================================
+   
+    {"Synthetic(300K-16F)",  "../data/synthetic_300000_16f.csv",     16, 2},
+    {"Synthetic(500K-16F)",  "../data/synthetic_500000_16f.csv",     16, 2},
+    {"Synthetic(1M-16F)",    "../data/synthetic_1000000_16f.csv",    16, 2},
+
+    // =========================================================
+    // SYNTHETIC DATASETS — 32 FEATURES
+    // =========================================================
+    {"Synthetic(100K-32F)",  "../data/synthetic_100000_32f.csv",     32, 2},
+    {"Synthetic(200K-32F)",  "../data/synthetic_200000_32f.csv",     32, 2},
+    {"Synthetic(300K-32F)",  "../data/synthetic_300000_32f.csv",     32, 2},
+    {"Synthetic(500K-32F)",  "../data/synthetic_500000_32f.csv",     32, 2},
+    {"Synthetic(1M-32F)",    "../data/synthetic_1000000_32f.csv",    32, 2}
     };
 
     for (const auto &d : datasets)
@@ -555,7 +580,14 @@ int runAllTests()
     // Measures sequential and parallel training time vs n_samples.
     printSection("GPU Scalability -- Training Time vs Dataset Size");
     {
-        std::vector<int> sizes = {500, 1000, 2000, 5000, 10000, 25000};
+        std::vector<int> sizes = {
+                                    5000,
+                                    50000,
+                                    100000,
+                                    200000,
+                                    300000,
+                                    1000000
+                                };
         const int n_feat = 20, depth = 7, leaf = 2, reps = 3;
 
         std::cout << std::left
@@ -670,14 +702,38 @@ int runAllTests()
 
     struct ScaleConfig { std::string name, path; int depth, leaf; };
     std::vector<ScaleConfig> scale_datasets = {
-        {"Iris",           "../data/iris.csv",           5,  1},
-        {"Wine",           "../data/wine.csv",           5,  1},
-        {"Breast Cancer",  "../data/breast_cancer.csv",  7,  2},
-        {"Banknote Auth",  "../data/banknote.csv",        5,  1},
-        {"Synthetic (6k)", "../data/synthetic.csv",       8,  1},
-        {"Synthetic 200k", "../data/synthetic_200k.csv",  8,  5},
-         {"Synthetic(1M)",  "../data/synthetic_1m.csv",    8, 5}
-    };
+    // =========================================================
+    // REAL DATASETS
+    // =========================================================
+    {"Breast Cancer",        "../data/breast_cancer.csv",            30, 2},
+    {"Banknote Auth",        "../data/banknote.csv",                  4, 2},
+    {"CoverType",            "../data/covertype.csv",                54, 7},
+
+    // =========================================================
+    // SYNTHETIC DATASETS — 8 FEATURES
+    // =========================================================
+    {"Synthetic(100K-8F)",   "../data/synthetic_100000_8f.csv",       8, 2},
+    {"Synthetic(200K-8F)",   "../data/synthetic_200000_8f.csv",       8, 2},
+    {"Synthetic(300K-8F)",   "../data/synthetic_300000_8f.csv",       8, 2},
+    {"Synthetic(500K-8F)",   "../data/synthetic_500000_8f.csv",       8, 2},
+    {"Synthetic(1M-8F)",     "../data/synthetic_1000000_8f.csv",      8, 2},
+
+    // =========================================================
+    // SYNTHETIC DATASETS — 16 FEATURES
+    // =========================================================
+    {"Synthetic(300K-16F)",  "../data/synthetic_300000_16f.csv",     16, 2},
+    {"Synthetic(500K-16F)",  "../data/synthetic_500000_16f.csv",     16, 2},
+    {"Synthetic(1M-16F)",    "../data/synthetic_1000000_16f.csv",    16, 2},
+
+    // =========================================================
+    // SYNTHETIC DATASETS — 32 FEATURES
+    // =========================================================
+    {"Synthetic(100K-32F)",  "../data/synthetic_100000_32f.csv",     32, 2},
+    {"Synthetic(200K-32F)",  "../data/synthetic_200000_32f.csv",     32, 2},
+    {"Synthetic(300K-32F)",  "../data/synthetic_300000_32f.csv",     32, 2},
+    {"Synthetic(500K-32F)",  "../data/synthetic_500000_32f.csv",     32, 2},
+    {"Synthetic(1M-32F)",    "../data/synthetic_1000000_32f.csv",    32, 2}
+};
 
     std::cout << std::left
               << std::setw(24) << "Dataset"
